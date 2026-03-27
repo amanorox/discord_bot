@@ -192,32 +192,77 @@ async def synthesize_and_play_timeline(timed_lines: list[tuple[int, str]], targe
 
 
 @bot.command()
-async def create_event(ctx, event_name: str, date_str: str):
-    try:
-        current_year = datetime.datetime.now().year
-        full_date_str = f"{current_year}-{date_str}"
-        event_date = datetime.datetime.strptime(full_date_str, "%Y-%m-%d").date()
+async def create_event(ctx, event_name: str, *date_strs: str):
+    if not date_strs:
+        await ctx.send("日付を1つ以上指定してください。MM-DD 形式をスペース区切りで複数指定できます。")
+        return
 
+    current_year = datetime.datetime.now().year
+    valid_dates: list[tuple[str, datetime.date]] = []
+    invalid_inputs: list[str] = []
+
+    for date_str in date_strs:
+        try:
+            full_date_str = f"{current_year}-{date_str}"
+            parsed_date = datetime.datetime.strptime(full_date_str, "%Y-%m-%d").date()
+            valid_dates.append((date_str, parsed_date))
+        except ValueError:
+            invalid_inputs.append(date_str)
+
+    seen_dates: set[datetime.date] = set()
+    duplicate_inputs: list[str] = []
+    unique_valid_dates: list[tuple[str, datetime.date]] = []
+    for original_input, parsed_date in valid_dates:
+        if parsed_date in seen_dates:
+            duplicate_inputs.append(original_input)
+            continue
+        seen_dates.add(parsed_date)
+        unique_valid_dates.append((original_input, parsed_date))
+
+    success_messages: list[str] = []
+    failed_messages: list[str] = []
+
+    for _, event_date in unique_valid_dates:
         start_time_jst = datetime.datetime.combine(event_date, datetime.time(22, 0, 0))
         start_time = start_time_jst - datetime.timedelta(hours=9)
         start_time = start_time.replace(tzinfo=datetime.timezone.utc)
         end_time = start_time + datetime.timedelta(hours=2)
 
-        event = await ctx.guild.create_scheduled_event(
-            name=event_name,
-            description="Python Bot による自動作成イベント",
-            start_time=start_time,
-            end_time=end_time,
-            location="Gaia DC",
-            privacy_level=discord.PrivacyLevel.guild_only,
-            entity_type=discord.EntityType.external,
-        )
+        try:
+            event = await ctx.guild.create_scheduled_event(
+                name=event_name,
+                description="Python Bot による自動作成イベント",
+                start_time=start_time,
+                end_time=end_time,
+                location="Gaia DC",
+                privacy_level=discord.PrivacyLevel.guild_only,
+                entity_type=discord.EntityType.external,
+            )
+            success_messages.append(
+                f"- {event.name}: {start_time_jst.strftime('%Y-%m-%d %H:%M JST')} - {(start_time_jst + datetime.timedelta(hours=2)).strftime('%Y-%m-%d %H:%M JST')}"
+            )
+        except Exception as e:
+            failed_messages.append(f"- {event_date.strftime('%Y-%m-%d')}: {e}")
 
-        await ctx.send(
-            f"イベントを作成しました: {event.name} (開始: {start_time_jst.strftime('%Y-%m-%d %H:%M JST')}, 終了: {(start_time_jst + datetime.timedelta(hours=2)).strftime('%Y-%m-%d %H:%M JST')})"
-        )
-    except ValueError:
-        await ctx.send("日付の形式が正しくありません。MM-DD 形式で指定してください。")
+    if invalid_inputs:
+        failed_messages.append(f"- 形式不正: {', '.join(invalid_inputs)} (MM-DD 形式で指定してください)")
+    if duplicate_inputs:
+        failed_messages.append(f"- 重複入力のためスキップ: {', '.join(duplicate_inputs)}")
+
+    response_lines: list[str] = []
+    if success_messages:
+        response_lines.append("イベントを作成しました:")
+        response_lines.extend(success_messages)
+    if failed_messages:
+        if success_messages:
+            response_lines.append("")
+        response_lines.append("作成できなかった項目:")
+        response_lines.extend(failed_messages)
+
+    if not response_lines:
+        response_lines.append("処理対象の日付がありませんでした。")
+
+    await ctx.send("\n".join(response_lines))
 
 
 @bot.command()
