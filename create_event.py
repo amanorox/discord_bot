@@ -36,6 +36,49 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 bot_ready_event = threading.Event()
+MAX_REPLY_CHAIN_MESSAGES = 10
+MAX_REPLY_MESSAGE_CHARS = 5000
+
+
+def build_message_text_for_openai(message: discord.Message) -> str:
+    text = message.content.strip()
+    if not text:
+        return ""
+
+    if len(text) > MAX_REPLY_MESSAGE_CHARS:
+        text = text[:MAX_REPLY_MESSAGE_CHARS] + "..."
+
+    return text
+
+
+async def collect_reply_chain_messages(message: discord.Message, max_messages: int = MAX_REPLY_CHAIN_MESSAGES) -> list[
+    discord.Message]:
+    chain: list[discord.Message] = []
+    visited_ids: set[int] = set()
+    current = message
+
+    for _ in range(max_messages):
+        reference = current.reference
+        if reference is None or reference.message_id is None:
+            break
+
+        ref_message_id = reference.message_id
+        if ref_message_id in visited_ids:
+            break
+        visited_ids.add(ref_message_id)
+
+        referenced = reference.resolved if isinstance(reference.resolved, discord.Message) else None
+        if referenced is None:
+            try:
+                referenced = await current.channel.fetch_message(ref_message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                break
+
+        chain.append(referenced)
+        current = referenced
+
+    chain.reverse()
+    return chain
 
 
 @bot.event
@@ -52,12 +95,26 @@ async def on_message(message):
     if bot.user in message.mentions:
         try:
             user_content = message.content.replace(f"<@{bot.user.id}>", "").strip()
+            if not user_content:
+                await message.reply("メンションの後に質問内容を入力してください。")
+                return
+
+            chain_messages = await collect_reply_chain_messages(message)
+            openai_input = [{"role": "developer", "content": "You are a helpful assistant for Final Fantasy XIV."}]
+
+            for chain_message in chain_messages:
+                chain_text = build_message_text_for_openai(chain_message)
+                if not chain_text:
+                    continue
+
+                role = "assistant" if bot.user is not None and chain_message.author.id == bot.user.id else "user"
+                openai_input.append({"role": role, "content": chain_text})
+
+            openai_input.append({"role": "user", "content": user_content})
+
             response = client.responses.create(
                 model="gpt-5.4-mini",
-                input=[
-                    {"role": "developer", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": user_content},
-                ],
+                input=openai_input,
             )
             await message.reply(response.output_text)
         except Exception as e:
@@ -321,11 +378,11 @@ def build_gui():
     playback_state = {"future": None}
 
     def update_ui(
-        message: str,
-        enable_play: bool = True,
-        enable_stop: bool = False,
-        enable_leave: bool = True,
-        enable_offset: bool = True,
+            message: str,
+            enable_play: bool = True,
+            enable_stop: bool = False,
+            enable_leave: bool = True,
+            enable_offset: bool = True,
     ):
         status_var.set(message)
         play_button.config(state=tk.NORMAL if enable_play else tk.DISABLED)
@@ -406,7 +463,8 @@ def build_gui():
         if has_running_timeline:
             current_future.cancel()
 
-        update_ui("再生を停止しています...", enable_play=False, enable_stop=False, enable_leave=False, enable_offset=False)
+        update_ui("再生を停止しています...", enable_play=False, enable_stop=False, enable_leave=False,
+                  enable_offset=False)
         future = asyncio.run_coroutine_threadsafe(stop_current_playback(VOICE_CHANNEL_ID), bot.loop)
 
         def done_callback(done_future):
@@ -415,11 +473,14 @@ def build_gui():
                 if has_running_timeline:
                     return
                 if stopped_now:
-                    root.after(0, lambda: update_ui("現在の再生を停止しました。", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
+                    root.after(0, lambda: update_ui("現在の再生を停止しました。", enable_play=True, enable_stop=False,
+                                                    enable_leave=True, enable_offset=True))
                 else:
-                    root.after(0, lambda: update_ui("停止対象の再生はありません。", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
+                    root.after(0, lambda: update_ui("停止対象の再生はありません。", enable_play=True, enable_stop=False,
+                                                    enable_leave=True, enable_offset=True))
             except Exception as e:
-                root.after(0, lambda: update_ui(f"停止に失敗しました: {e}", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
+                root.after(0, lambda: update_ui(f"停止に失敗しました: {e}", enable_play=True, enable_stop=False,
+                                                enable_leave=True, enable_offset=True))
 
         future.add_done_callback(done_callback)
 
@@ -432,7 +493,8 @@ def build_gui():
         if current_future is not None and not current_future.done():
             current_future.cancel()
 
-        update_ui("VCから退室しています...", enable_play=False, enable_stop=False, enable_leave=False, enable_offset=False)
+        update_ui("VCから退室しています...", enable_play=False, enable_stop=False, enable_leave=False,
+                  enable_offset=False)
         future = asyncio.run_coroutine_threadsafe(leave_voice_channel(VOICE_CHANNEL_ID), bot.loop)
 
         def done_callback(done_future):
@@ -440,11 +502,14 @@ def build_gui():
                 playback_state["future"] = None
                 disconnected = done_future.result()
                 if disconnected:
-                    root.after(0, lambda: update_ui("VCから退室しました。", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
+                    root.after(0, lambda: update_ui("VCから退室しました。", enable_play=True, enable_stop=False,
+                                                    enable_leave=True, enable_offset=True))
                 else:
-                    root.after(0, lambda: update_ui("BotはVCに接続していません。", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
+                    root.after(0, lambda: update_ui("BotはVCに接続していません。", enable_play=True, enable_stop=False,
+                                                    enable_leave=True, enable_offset=True))
             except Exception as e:
-                root.after(0, lambda: update_ui(f"VC退室に失敗しました: {e}", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
+                root.after(0, lambda: update_ui(f"VC退室に失敗しました: {e}", enable_play=True, enable_stop=False,
+                                                enable_leave=True, enable_offset=True))
 
         future.add_done_callback(done_callback)
 
@@ -485,4 +550,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
