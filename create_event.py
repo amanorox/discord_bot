@@ -1,7 +1,9 @@
 import asyncio
+import concurrent.futures
 import datetime
 import os
 import threading
+import time
 import tkinter as tk
 from tkinter import scrolledtext
 
@@ -107,6 +109,22 @@ async def leave_voice_channel(target_channel_id: int) -> bool:
     return True
 
 
+async def stop_current_playback(target_channel_id: int) -> bool:
+    channel = bot.get_channel(target_channel_id)
+    if not isinstance(channel, discord.VoiceChannel):
+        raise RuntimeError(f"指定したチャンネルID {target_channel_id} はボイスチャンネルではありません。")
+
+    voice_client = discord.utils.get(bot.voice_clients, guild=channel.guild)
+    if voice_client is None or not voice_client.is_connected():
+        return False
+
+    if voice_client.is_playing():
+        voice_client.stop()
+        return True
+
+    return False
+
+
 async def synthesize_and_play(text: str, target_channel_id: int):
     if not text:
         raise RuntimeError("テキストが空です。")
@@ -117,6 +135,60 @@ async def synthesize_and_play(text: str, target_channel_id: int):
 
     await asyncio.to_thread(save_wave, text, output_path=AUDIOFILE, params=VoiceParams(speed=55))
     await play_audio_file_in_channel(channel, AUDIOFILE)
+
+
+def parse_timed_lines(script_text: str) -> list[tuple[int, str]]:
+    timed_lines: list[tuple[int, str]] = []
+    last_seconds = -1
+
+    for line_no, raw_line in enumerate(script_text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            raise RuntimeError(f"{line_no}行目の形式が不正です。`MM:SS 読み上げテキスト` 形式で入力してください。")
+
+        time_part, text = parts[0], parts[1].strip()
+        if not text:
+            raise RuntimeError(f"{line_no}行目に読み上げテキストがありません。")
+
+        try:
+            mm_str, ss_str = time_part.split(":", maxsplit=1)
+            minutes = int(mm_str)
+            seconds = int(ss_str)
+        except ValueError as exc:
+            raise RuntimeError(f"{line_no}行目の時刻が不正です。`MM:SS` 形式で入力してください。") from exc
+
+        if minutes < 0 or seconds < 0 or seconds >= 60:
+            raise RuntimeError(f"{line_no}行目の時刻が不正です。秒は 00-59 の範囲で入力してください。")
+
+        elapsed_seconds = minutes * 60 + seconds
+        if elapsed_seconds < last_seconds:
+            raise RuntimeError(f"{line_no}行目の時刻が前の行より小さいです。時刻は昇順で入力してください。")
+
+        timed_lines.append((elapsed_seconds, text))
+        last_seconds = elapsed_seconds
+
+    if not timed_lines:
+        raise RuntimeError("有効な読み上げデータがありません。")
+
+    return timed_lines
+
+
+async def synthesize_and_play_timeline(timed_lines: list[tuple[int, str]], target_channel_id: int, origin_time: float):
+    channel = bot.get_channel(target_channel_id)
+    if not isinstance(channel, discord.VoiceChannel):
+        raise RuntimeError(f"指定したチャンネルID {target_channel_id} はボイスチャンネルではありません。")
+
+    for elapsed_seconds, text in timed_lines:
+        remaining = origin_time + elapsed_seconds - time.monotonic()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+        await asyncio.to_thread(save_wave, text, output_path=AUDIOFILE, params=VoiceParams(speed=55))
+        await play_audio_file_in_channel(channel, AUDIOFILE)
 
 
 @bot.command()
@@ -168,14 +240,22 @@ async def play_test(ctx):
 def build_gui():
     root = tk.Tk()
     root.title("Discord Bot Controller")
-    root.geometry("560x340")
+    root.geometry("560x380")
 
     title = tk.Label(root, text="読み上げテキスト", anchor="w")
     title.pack(fill="x", padx=12, pady=(12, 4))
 
+    offset_frame = tk.Frame(root)
+    offset_frame.pack(fill="x", padx=12, pady=(0, 8))
+    offset_label = tk.Label(offset_frame, text="再生開始オフセット秒数（正負の整数）")
+    offset_label.pack(side="left")
+    offset_entry = tk.Entry(offset_frame, width=8)
+    offset_entry.pack(side="left", padx=(8, 0))
+    offset_entry.insert(0, "0")
+
     input_box = scrolledtext.ScrolledText(root, wrap=tk.WORD, height=10)
     input_box.pack(fill="both", expand=True, padx=12)
-    input_box.insert("1.0", "ここに読み上げたいテキストを入力してください。")
+    input_box.insert("1.0", "00:00 ここに読み上げたいテキストを入力してください。")
 
     status_var = tk.StringVar(value="Bot起動中...")
     status = tk.Label(root, textvariable=status_var, anchor="w")
@@ -187,33 +267,114 @@ def build_gui():
     play_button = tk.Button(button_frame, text="再生")
     play_button.pack(side="left", fill="x", expand=True)
 
+    stop_button = tk.Button(button_frame, text="再生停止")
+    stop_button.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
     leave_button = tk.Button(button_frame, text="VC退室")
     leave_button.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
-    def update_ui(message: str, enable_play: bool = True, enable_leave: bool = True):
+    playback_state = {"future": None}
+
+    def update_ui(
+        message: str,
+        enable_play: bool = True,
+        enable_stop: bool = False,
+        enable_leave: bool = True,
+        enable_offset: bool = True,
+    ):
         status_var.set(message)
         play_button.config(state=tk.NORMAL if enable_play else tk.DISABLED)
+        stop_button.config(state=tk.NORMAL if enable_stop else tk.DISABLED)
         leave_button.config(state=tk.NORMAL if enable_leave else tk.DISABLED)
+        offset_entry.config(state=tk.NORMAL if enable_offset else tk.DISABLED)
+
+    def finish_playback(message: str):
+        playback_state["future"] = None
+        update_ui(message, enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True)
 
     def on_play_click():
-        text = input_box.get("1.0", tk.END).strip()
-        if not text:
-            update_ui("テキストを入力してください。")
+        current_future = playback_state["future"]
+        if current_future is not None and not current_future.done():
+            update_ui(
+                "すでに再生中です。停止してから再実行してください。",
+                enable_play=False,
+                enable_stop=True,
+                enable_leave=False,
+                enable_offset=False,
+            )
+            return
+
+        text = input_box.get("1.0", tk.END)
+
+        try:
+            timed_lines = parse_timed_lines(text)
+        except RuntimeError as e:
+            update_ui(str(e))
             return
 
         if not bot_ready_event.is_set():
             update_ui("Botの接続完了を待っています。")
             return
 
-        update_ui("音声を生成して再生中です...", enable_play=False, enable_leave=False)
-        future = asyncio.run_coroutine_threadsafe(synthesize_and_play(text, VOICE_CHANNEL_ID), bot.loop)
+        offset_raw = offset_entry.get().strip()
+        if offset_raw == "":
+            offset_seconds = 0
+        else:
+            try:
+                offset_seconds = int(offset_raw)
+            except ValueError:
+                update_ui("オフセット秒数は正負の整数で入力してください。")
+                return
+
+        origin_time = time.monotonic() + offset_seconds
+        update_ui(
+            f"スケジュール再生を開始しました... (オフセット: {offset_seconds:+d}秒)",
+            enable_play=False,
+            enable_stop=True,
+            enable_leave=False,
+            enable_offset=False,
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            synthesize_and_play_timeline(timed_lines, VOICE_CHANNEL_ID, origin_time),
+            bot.loop,
+        )
+        playback_state["future"] = future
 
         def done_callback(done_future):
             try:
                 done_future.result()
-                root.after(0, lambda: update_ui("再生が完了しました。"))
+                root.after(0, lambda: finish_playback("再生が完了しました。"))
+            except concurrent.futures.CancelledError:
+                root.after(0, lambda: finish_playback("再生を中断しました。"))
             except Exception as e:
-                root.after(0, lambda: update_ui(f"再生に失敗しました: {e}"))
+                root.after(0, lambda: finish_playback(f"再生に失敗しました: {e}"))
+
+        future.add_done_callback(done_callback)
+
+    def on_stop_click():
+        if not bot_ready_event.is_set():
+            update_ui("Botの接続完了を待っています。")
+            return
+
+        current_future = playback_state["future"]
+        has_running_timeline = current_future is not None and not current_future.done()
+        if has_running_timeline:
+            current_future.cancel()
+
+        update_ui("再生を停止しています...", enable_play=False, enable_stop=False, enable_leave=False, enable_offset=False)
+        future = asyncio.run_coroutine_threadsafe(stop_current_playback(VOICE_CHANNEL_ID), bot.loop)
+
+        def done_callback(done_future):
+            try:
+                stopped_now = done_future.result()
+                if has_running_timeline:
+                    return
+                if stopped_now:
+                    root.after(0, lambda: update_ui("現在の再生を停止しました。", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
+                else:
+                    root.after(0, lambda: update_ui("停止対象の再生はありません。", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
+            except Exception as e:
+                root.after(0, lambda: update_ui(f"停止に失敗しました: {e}", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
 
         future.add_done_callback(done_callback)
 
@@ -222,22 +383,31 @@ def build_gui():
             update_ui("Botの接続完了を待っています。")
             return
 
-        update_ui("VCから退室しています...", enable_play=False, enable_leave=False)
+        current_future = playback_state["future"]
+        if current_future is not None and not current_future.done():
+            current_future.cancel()
+
+        update_ui("VCから退室しています...", enable_play=False, enable_stop=False, enable_leave=False, enable_offset=False)
         future = asyncio.run_coroutine_threadsafe(leave_voice_channel(VOICE_CHANNEL_ID), bot.loop)
 
         def done_callback(done_future):
             try:
+                playback_state["future"] = None
                 disconnected = done_future.result()
                 if disconnected:
-                    root.after(0, lambda: update_ui("VCから退室しました。"))
+                    root.after(0, lambda: update_ui("VCから退室しました。", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
                 else:
-                    root.after(0, lambda: update_ui("BotはVCに接続していません。"))
+                    root.after(0, lambda: update_ui("BotはVCに接続していません。", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
             except Exception as e:
-                root.after(0, lambda: update_ui(f"VC退室に失敗しました: {e}"))
+                root.after(0, lambda: update_ui(f"VC退室に失敗しました: {e}", enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True))
 
         future.add_done_callback(done_callback)
 
     def on_close():
+        current_future = playback_state["future"]
+        if current_future is not None and not current_future.done():
+            current_future.cancel()
+
         if bot_ready_event.is_set() and not bot.is_closed():
             try:
                 asyncio.run_coroutine_threadsafe(bot.close(), bot.loop).result(timeout=5)
@@ -246,7 +416,9 @@ def build_gui():
         root.destroy()
 
     play_button.config(command=on_play_click)
+    stop_button.config(command=on_stop_click)
     leave_button.config(command=on_leave_click)
+    update_ui("Bot起動中...", enable_play=True, enable_stop=False, enable_leave=True)
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
