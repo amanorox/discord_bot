@@ -1,6 +1,8 @@
 import asyncio
 import concurrent.futures
 import datetime
+import inspect
+import json
 import os
 import threading
 import time
@@ -38,6 +40,146 @@ client = openai.OpenAI(api_key=OPENAI_API_KEY)
 bot_ready_event = threading.Event()
 MAX_REPLY_CHAIN_MESSAGES = 10
 MAX_REPLY_MESSAGE_CHARS = 5000
+MAX_TOOL_CALL_ROUNDS = 5
+
+tools = [
+    {
+        "type": "function",
+        "name": "list_all_event",
+        "description": "Get all scheduled events. 作成済みのイベント一覧を取得します。",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+]
+
+def parse_tool_arguments(arguments_raw) -> dict:
+    if arguments_raw is None:
+        return {}
+
+    if isinstance(arguments_raw, dict):
+        return arguments_raw
+
+    if not isinstance(arguments_raw, str):
+        raise RuntimeError("ツール引数の形式が不正です。")
+
+    text = arguments_raw.strip()
+    if not text:
+        return {}
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("ツール引数のJSON解析に失敗しました。") from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("ツール引数はJSONオブジェクトである必要があります。")
+
+    return parsed
+
+
+async def build_tool_outputs(response) -> list[dict[str, str]]:
+    tool_outputs: list[dict[str, str]] = []
+
+    for item in getattr(response, "output", []):
+        if getattr(item, "type", None) != "function_call":
+            continue
+
+        call_id = getattr(item, "call_id", None)
+        tool_name = getattr(item, "name", "")
+        arguments_raw = getattr(item, "arguments", None)
+
+        if not call_id:
+            continue
+
+        tool_fn = TOOL_REGISTRY.get(tool_name)
+        if tool_fn is None:
+            tool_outputs.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": f"未対応のツールです: {tool_name}",
+                }
+            )
+            continue
+
+        try:
+            args = parse_tool_arguments(arguments_raw)
+            if args:
+                raise RuntimeError("このツールは引数を受け取りません。")
+
+            result = tool_fn()
+            if inspect.isawaitable(result):
+                result = await result
+            output = str(result)
+        except Exception as exc:
+            output = f"ツール実行中にエラーが発生しました: {exc}"
+
+        tool_outputs.append(
+            {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            }
+        )
+
+    return tool_outputs
+
+
+async def list_all_event() -> str:
+    if not bot_ready_event.is_set() or bot.user is None:
+        return "Botの接続完了前のため、イベント一覧を取得できません。"
+
+    if bot.is_closed():
+        return "Botのイベントループが停止しているため、イベント一覧を取得できません。"
+
+    jst = datetime.timezone(datetime.timedelta(hours=9), name="JST")
+    lines: list[str] = []
+
+    try:
+        for guild in bot.guilds:
+            try:
+                scheduled_events = await guild.fetch_scheduled_events()
+            except Exception:
+                scheduled_events = list(getattr(guild, "scheduled_events", []))
+
+            if not scheduled_events:
+                continue
+
+            scheduled_events.sort(
+                key=lambda ev: ev.start_time if ev.start_time is not None else datetime.datetime.max.replace(
+                    tzinfo=datetime.timezone.utc
+                )
+            )
+
+            lines.append(f"[{guild.name}]")
+            for event in scheduled_events:
+                if event.start_time is None:
+                    start_text = "開始時刻未設定"
+                else:
+                    start_text = event.start_time.astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
+
+                if event.end_time is None:
+                    end_text = "終了時刻未設定"
+                else:
+                    end_text = event.end_time.astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
+
+                lines.append(f"- {event.name}: {start_text} - {end_text}")
+    except Exception as e:
+        return f"イベント一覧の取得に失敗しました: {e}"
+
+    if not lines:
+        return "現在予定されているイベントはありません。"
+
+    return "\n".join(lines)
+
+
+TOOL_REGISTRY = {
+    "list_all_event": list_all_event,
+}
 
 
 def build_message_text_for_openai(message: discord.Message) -> str:
@@ -100,7 +242,7 @@ async def on_message(message):
                 return
 
             chain_messages = await collect_reply_chain_messages(message)
-            openai_input = [{"role": "developer", "content": "You are a helpful assistant for Final Fantasy XIV."}]
+            openai_input = [{"role": "developer", "content": "You are a Discord bot for Final Fantasy XIV Guild."}]
 
             for chain_message in chain_messages:
                 chain_text = build_message_text_for_openai(chain_message)
@@ -112,11 +254,31 @@ async def on_message(message):
 
             openai_input.append({"role": "user", "content": user_content})
 
-            response = client.responses.create(
-                model="gpt-5.4-mini",
-                input=openai_input,
-            )
-            await message.reply(response.output_text)
+            response = client.responses.create(model="gpt-5.4-mini", tools=tools, input=openai_input)
+
+            rounds = 0
+            while rounds < MAX_TOOL_CALL_ROUNDS:
+                tool_outputs = await build_tool_outputs(response)
+                if not tool_outputs:
+                    break
+
+                response = client.responses.create(
+                    model="gpt-5.4-mini",
+                    tools=tools,
+                    previous_response_id=response.id,
+                    input=tool_outputs,
+                )
+                rounds += 1
+
+            if rounds >= MAX_TOOL_CALL_ROUNDS and await build_tool_outputs(response):
+                await message.reply("ツール呼び出しの上限に達したため、処理を中断しました。")
+                return
+
+            reply_text = (response.output_text or "").strip()
+            if not reply_text:
+                reply_text = "回答を生成できませんでした。"
+
+            await message.reply(reply_text)
         except Exception as e:
             print(f"Error: {e}")
             await message.channel.send(f"エラーが発生しました: {e}")
