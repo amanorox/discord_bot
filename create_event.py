@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import concurrent.futures
 import datetime
@@ -6,8 +7,6 @@ import json
 import os
 import threading
 import time
-import tkinter as tk
-from tkinter import scrolledtext
 
 import discord
 import openai
@@ -502,6 +501,9 @@ async def play_test(ctx):
 
 
 def build_gui():
+    import tkinter as tk
+    from tkinter import scrolledtext
+
     root = tk.Tk()
     root.title("Discord Bot Controller")
     root.geometry("560x380")
@@ -704,10 +706,30 @@ def start_bot_in_background():
     return thread
 
 
-def main():
-    start_cevio()
-    start_bot_in_background()
-    build_gui()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Discord event bot runner")
+    parser.add_argument(
+        "--tts",
+        action="store_true",
+        help="CeVIO TTS と GUI コントローラーを有効化します。",
+    )
+    return parser.parse_args(argv)
+
+
+def run_bot_forever():
+    bot.run(TOKEN)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    if args.tts:
+        start_cevio()
+        start_bot_in_background()
+        build_gui()
+        return
+
+    run_bot_forever()
 
 
 if __name__ == "__main__":
