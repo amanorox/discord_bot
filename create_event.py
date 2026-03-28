@@ -241,7 +241,7 @@ async def on_message(message):
                 return
 
             chain_messages = await collect_reply_chain_messages(message)
-            openai_input = [{"role": "developer", "content": "You are a Discord bot for Final Fantasy XIV Guild."}]
+            openai_input = [{"role": "developer", "content": "You are a Discord bot for Final Fantasy XIV Guild Tranquility."}]
 
             for chain_message in chain_messages:
                 chain_text = build_message_text_for_openai(chain_message)
