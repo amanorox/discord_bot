@@ -345,6 +345,8 @@ async def on_message(message):
             if not reply_text:
                 reply_text = "回答を生成できませんでした。"
 
+            # max 1900 characters
+            reply_text = reply_text[:1900] + ("..." if len(reply_text) > 1900 else "")
             await message.reply(reply_text)
         except Exception as e:
             print(f"Error: {e}")
