@@ -53,7 +53,24 @@ tools = [
             "additionalProperties": False,
         },
     },
+    {
+        "type": "function",
+        "name": "get_webpage",
+        "description": "Fetch and extract readable main text from a webpage. Webページの本文テキストを取得します。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target page URL (http/https).",
+                }
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+    }
 ]
+
 
 def parse_tool_arguments(arguments_raw) -> dict:
     if arguments_raw is None:
@@ -107,10 +124,13 @@ async def build_tool_outputs(response) -> list[dict[str, str]]:
 
         try:
             args = parse_tool_arguments(arguments_raw)
-            if args:
-                raise RuntimeError("このツールは引数を受け取りません。")
 
-            result = tool_fn()
+            if args:
+                # Call tools with keyword arguments when provided by Function Calling.
+                result = tool_fn(**args)
+            else:
+                result = tool_fn()
+
             if inspect.isawaitable(result):
                 result = await result
             output = str(result)
@@ -126,6 +146,53 @@ async def build_tool_outputs(response) -> list[dict[str, str]]:
         )
 
     return tool_outputs
+
+
+async def get_webpage(url: str) -> str:
+    if not isinstance(url, str) or not url.strip():
+        return "URLが空です。"
+
+    target_url = url.strip()
+    if not (target_url.startswith("http://") or target_url.startswith("https://")):
+        return "URLは http:// または https:// で始めてください。"
+
+    def fetch_and_extract() -> str:
+        try:
+            import requests
+            from readability import Document
+            from bs4 import BeautifulSoup
+        except Exception as exc:
+            return f"依存ライブラリの読み込みに失敗しました: {exc}"
+
+        try:
+            response = requests.get(
+                target_url,
+                timeout=15,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; DiscordEventTool/1.0)",
+                },
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            return f"Webページの取得に失敗しました: {exc}"
+
+        html = response.text
+        if not html.strip():
+            return "Webページの内容が空でした。"
+
+        try:
+            doc = Document(html)
+            text = doc.summary(html_partial=True)
+        except Exception as exc:
+            return f"本文抽出に失敗しました: {exc}"
+
+        normalized = "\n".join(line for line in (x.strip() for x in text.splitlines()) if line)
+        if not normalized:
+            return "本文を抽出できませんでした。"
+
+        return normalized
+
+    return await asyncio.to_thread(fetch_and_extract)
 
 
 async def list_all_event() -> str:
@@ -178,6 +245,7 @@ async def list_all_event() -> str:
 
 TOOL_REGISTRY = {
     "list_all_event": list_all_event,
+    "get_webpage": get_webpage,
 }
 
 
@@ -241,7 +309,8 @@ async def on_message(message):
                 return
 
             chain_messages = await collect_reply_chain_messages(message)
-            openai_input = [{"role": "developer", "content": "You are a Discord bot for Final Fantasy XIV Guild Tranquility."}]
+            openai_input = [
+                {"role": "developer", "content": "You are a Discord bot for Final Fantasy XIV Guild Tranquility."}]
 
             for chain_message in chain_messages:
                 chain_text = build_message_text_for_openai(chain_message)
