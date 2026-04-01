@@ -1,0 +1,6 @@
+discord.py
+openai
+python-dotenv
+pywin32
+requests
+readability-lxml

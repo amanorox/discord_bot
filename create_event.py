@@ -160,7 +160,6 @@ async def get_webpage(url: str) -> str:
         try:
             import requests
             from readability import Document
-            from bs4 import BeautifulSoup
         except Exception as exc:
             return f"依存ライブラリの読み込みに失敗しました: {exc}"
 
