@@ -2,5 +2,6 @@ discord.py
 openai
 python-dotenv
 requests
+docling
 readability-lxml
 pywin32

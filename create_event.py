@@ -292,6 +292,10 @@ async def collect_reply_chain_messages(message: discord.Message, max_messages: i
 @bot.event
 async def on_ready():
     print(f"[INFO] Logged in as {bot.user}")
+    for guild in bot.guilds:
+        print(f"[INFO] Guild: {guild.name} (id={guild.id})")
+        for channel in guild.channels:
+            print(f"[INFO]   #{channel.name} (id={channel.id}, type={channel.type})")
     bot_ready_event.set()
 
 
