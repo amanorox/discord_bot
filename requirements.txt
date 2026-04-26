@@ -5,3 +5,6 @@ requests
 docling
 readability-lxml
 pywin32
+torch
+fastapi
+uvicorn[standard]

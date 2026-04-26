@@ -7,12 +7,16 @@ import json
 import os
 import threading
 import time
+from pathlib import Path
 
 import discord
 import openai
+import uvicorn
 from discord.ext import commands
 from dotenv import load_dotenv
-
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from cevio_tts import VoiceParams, save_wave, start_cevio
 
 load_dotenv()
@@ -27,8 +31,10 @@ if not OPENAI_API_KEY:
 
 AUDIOFILE = "test.wav"
 VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID", "1482359368992161918"))
+WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 DEFAULT_FFMPEG = "C:\\Users\\amano\\AppData\\Local\\Microsoft\\WinGet\\Links\\ffmpeg.exe"
 FFMPEG_EXECUTABLE = os.getenv("FFMPEG_PATH") or (DEFAULT_FFMPEG if os.path.exists(DEFAULT_FFMPEG) else "ffmpeg")
+STATIC_DIR = Path(__file__).parent / "static"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -41,6 +47,178 @@ MAX_REPLY_CHAIN_MESSAGES = 10
 MAX_REPLY_MESSAGE_CHARS = 5000
 MAX_TOOL_CALL_ROUNDS = 5
 
+# ---------- Web server state ----------
+web_playback_state: dict = {"future": None}
+ws_clients: set[WebSocket] = set()
+_ws_loop: asyncio.AbstractEventLoop | None = None
+
+
+async def broadcast_status(message: str, is_playing: bool) -> None:
+    payload = json.dumps({"message": message, "is_playing": is_playing})
+    dead: set[WebSocket] = set()
+    for ws in list(ws_clients):
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead.add(ws)
+    ws_clients.difference_update(dead)
+
+
+def _schedule_broadcast(message: str, is_playing: bool) -> None:
+    """Thread-safe broadcast trigger from non-async context."""
+    if _ws_loop is not None and not _ws_loop.is_closed():
+        asyncio.run_coroutine_threadsafe(broadcast_status(message, is_playing), _ws_loop)
+
+
+# ---------- FastAPI app ----------
+app = FastAPI()
+
+STATIC_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/")
+async def index():
+    return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.get("/status")
+async def status():
+    is_playing = (
+        web_playback_state["future"] is not None
+        and not web_playback_state["future"].done()
+    )
+    return JSONResponse({
+        "bot_ready": bot_ready_event.is_set(),
+        "is_playing": is_playing,
+    })
+
+
+class PlayRequest:
+    def __init__(self, script: str, offset: int = 0):
+        self.script = script
+        self.offset = offset
+
+
+from pydantic import BaseModel
+
+
+class PlayBody(BaseModel):
+    script: str
+    offset: int = 0
+
+
+@app.post("/play")
+async def api_play(body: PlayBody):
+    if not bot_ready_event.is_set():
+        return JSONResponse({"ok": False, "message": "Botの接続完了を待っています。"}, status_code=503)
+
+    current = web_playback_state["future"]
+    if current is not None and not current.done():
+        return JSONResponse({"ok": False, "message": "すでに再生中です。停止してから再実行してください。"}, status_code=409)
+
+    try:
+        timed_lines = parse_timed_lines(body.script)
+    except RuntimeError as e:
+        return JSONResponse({"ok": False, "message": str(e)}, status_code=400)
+
+    origin_time = time.monotonic() + body.offset
+    await broadcast_status(f"スケジュール再生を開始しました... (オフセット: {body.offset:+d}秒)", True)
+
+    future = asyncio.run_coroutine_threadsafe(
+        synthesize_and_play_timeline(timed_lines, VOICE_CHANNEL_ID, origin_time),
+        bot.loop,
+    )
+    web_playback_state["future"] = future
+
+    def done_callback(done_future: concurrent.futures.Future):
+        try:
+            done_future.result()
+            web_playback_state["future"] = None
+            _schedule_broadcast("再生が完了しました。", False)
+        except concurrent.futures.CancelledError:
+            web_playback_state["future"] = None
+            _schedule_broadcast("再生を中断しました。", False)
+        except Exception as exc:
+            web_playback_state["future"] = None
+            _schedule_broadcast(f"再生に失敗しました: {exc}", False)
+
+    future.add_done_callback(done_callback)
+    return JSONResponse({"ok": True, "message": f"スケジュール再生を開始しました。(オフセット: {body.offset:+d}秒)"})
+
+
+@app.post("/stop")
+async def api_stop():
+    if not bot_ready_event.is_set():
+        return JSONResponse({"ok": False, "message": "Botの接続完了を待っています。"}, status_code=503)
+
+    current = web_playback_state["future"]
+    has_running = current is not None and not current.done()
+    if has_running:
+        current.cancel()
+
+    await broadcast_status("再生を停止しています...", False)
+
+    loop = bot.loop
+    future = asyncio.run_coroutine_threadsafe(stop_current_playback(VOICE_CHANNEL_ID), loop)
+    try:
+        stopped = future.result(timeout=10)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "message": f"停止に失敗しました: {exc}"}, status_code=500)
+
+    if has_running or stopped:
+        msg = "現在の再生を停止しました。"
+    else:
+        msg = "停止対象の再生はありません。"
+    await broadcast_status(msg, False)
+    return JSONResponse({"ok": True, "message": msg})
+
+
+@app.post("/leave")
+async def api_leave():
+    if not bot_ready_event.is_set():
+        return JSONResponse({"ok": False, "message": "Botの接続完了を待っています。"}, status_code=503)
+
+    current = web_playback_state["future"]
+    if current is not None and not current.done():
+        current.cancel()
+    web_playback_state["future"] = None
+
+    await broadcast_status("VCから退室しています...", False)
+
+    future = asyncio.run_coroutine_threadsafe(leave_voice_channel(VOICE_CHANNEL_ID), bot.loop)
+    try:
+        disconnected = future.result(timeout=10)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "message": f"VC退室に失敗しました: {exc}"}, status_code=500)
+
+    msg = "VCから退室しました。" if disconnected else "BotはVCに接続していません。"
+    await broadcast_status(msg, False)
+    return JSONResponse({"ok": True, "message": msg})
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    global _ws_loop
+    _ws_loop = asyncio.get_event_loop()
+    await websocket.accept()
+    ws_clients.add(websocket)
+    is_playing = (
+        web_playback_state["future"] is not None
+        and not web_playback_state["future"].done()
+    )
+    await websocket.send_text(json.dumps({
+        "message": "接続しました。" if bot_ready_event.is_set() else "Bot起動中...",
+        "is_playing": is_playing,
+    }))
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_clients.discard(websocket)
+
+
+# ---------- OpenAI tools ----------
 tools = [
     {
         "type": "function",
@@ -75,25 +253,19 @@ tools = [
 def parse_tool_arguments(arguments_raw) -> dict:
     if arguments_raw is None:
         return {}
-
     if isinstance(arguments_raw, dict):
         return arguments_raw
-
     if not isinstance(arguments_raw, str):
         raise RuntimeError("ツール引数の形式が不正です。")
-
     text = arguments_raw.strip()
     if not text:
         return {}
-
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
         raise RuntimeError("ツール引数のJSON解析に失敗しました。") from exc
-
     if not isinstance(parsed, dict):
         raise RuntimeError("ツール引数はJSONオブジェクトである必要があります。")
-
     return parsed
 
 
@@ -124,13 +296,7 @@ async def build_tool_outputs(response) -> list[dict[str, str]]:
 
         try:
             args = parse_tool_arguments(arguments_raw)
-
-            if args:
-                # Call tools with keyword arguments when provided by Function Calling.
-                result = tool_fn(**args)
-            else:
-                result = tool_fn()
-
+            result = tool_fn(**args) if args else tool_fn()
             if inspect.isawaitable(result):
                 result = await result
             output = str(result)
@@ -167,9 +333,7 @@ async def get_webpage(url: str) -> str:
             response = requests.get(
                 target_url,
                 timeout=15,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; DiscordEventTool/1.0)",
-                },
+                headers={"User-Agent": "Mozilla/5.0 (compatible; DiscordEventTool/1.0)"},
             )
             response.raise_for_status()
         except requests.RequestException as exc:
@@ -186,10 +350,7 @@ async def get_webpage(url: str) -> str:
             return f"本文抽出に失敗しました: {exc}"
 
         normalized = "\n".join(line for line in (x.strip() for x in text.splitlines()) if line)
-        if not normalized:
-            return "本文を抽出できませんでした。"
-
-        return normalized
+        return normalized if normalized else "本文を抽出できませんでした。"
 
     return await asyncio.to_thread(fetch_and_extract)
 
@@ -197,7 +358,6 @@ async def get_webpage(url: str) -> str:
 async def list_all_event() -> str:
     if not bot_ready_event.is_set() or bot.user is None:
         return "Botの接続完了前のため、イベント一覧を取得できません。"
-
     if bot.is_closed():
         return "Botのイベントループが停止しているため、イベント一覧を取得できません。"
 
@@ -222,24 +382,19 @@ async def list_all_event() -> str:
 
             lines.append(f"[{guild.name}]")
             for event in scheduled_events:
-                if event.start_time is None:
-                    start_text = "開始時刻未設定"
-                else:
-                    start_text = event.start_time.astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
-
-                if event.end_time is None:
-                    end_text = "終了時刻未設定"
-                else:
-                    end_text = event.end_time.astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
-
+                start_text = (
+                    event.start_time.astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
+                    if event.start_time else "開始時刻未設定"
+                )
+                end_text = (
+                    event.end_time.astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
+                    if event.end_time else "終了時刻未設定"
+                )
                 lines.append(f"- {event.name}: {start_text} - {end_text}")
     except Exception as e:
         return f"イベント一覧の取得に失敗しました: {e}"
 
-    if not lines:
-        return "現在予定されているイベントはありません。"
-
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else "現在予定されているイベントはありません。"
 
 
 TOOL_REGISTRY = {
@@ -252,15 +407,14 @@ def build_message_text_for_openai(message: discord.Message) -> str:
     text = message.content.strip()
     if not text:
         return ""
-
     if len(text) > MAX_REPLY_MESSAGE_CHARS:
         text = text[:MAX_REPLY_MESSAGE_CHARS] + "..."
-
     return text
 
 
-async def collect_reply_chain_messages(message: discord.Message, max_messages: int = MAX_REPLY_CHAIN_MESSAGES) -> list[
-    discord.Message]:
+async def collect_reply_chain_messages(
+    message: discord.Message, max_messages: int = MAX_REPLY_CHAIN_MESSAGES
+) -> list[discord.Message]:
     chain: list[discord.Message] = []
     visited_ids: set[int] = set()
     current = message
@@ -269,7 +423,6 @@ async def collect_reply_chain_messages(message: discord.Message, max_messages: i
         reference = current.reference
         if reference is None or reference.message_id is None:
             break
-
         ref_message_id = reference.message_id
         if ref_message_id in visited_ids:
             break
@@ -289,6 +442,7 @@ async def collect_reply_chain_messages(message: discord.Message, max_messages: i
     return chain
 
 
+# ---------- Discord events ----------
 @bot.event
 async def on_ready():
     print(f"[INFO] Logged in as {bot.user}")
@@ -297,6 +451,7 @@ async def on_ready():
         for channel in guild.channels:
             print(f"[INFO]   #{channel.name} (id={channel.id}, type={channel.type})")
     bot_ready_event.set()
+    _schedule_broadcast("Bot接続完了。", False)
 
 
 @bot.event
@@ -313,18 +468,17 @@ async def on_message(message):
 
             chain_messages = await collect_reply_chain_messages(message)
             openai_input = [
-                {"role": "developer", "content": "You are a Discord bot for Final Fantasy XIV Guild Tranquility."}]
+                {"role": "developer", "content": "You are a Discord bot for Final Fantasy XIV Guild Tranquility."}
+            ]
 
             for chain_message in chain_messages:
                 chain_text = build_message_text_for_openai(chain_message)
                 if not chain_text:
                     continue
-
                 role = "assistant" if bot.user is not None and chain_message.author.id == bot.user.id else "user"
                 openai_input.append({"role": role, "content": chain_text})
 
             openai_input.append({"role": "user", "content": user_content})
-
             response = client.responses.create(model="gpt-5.4-mini", tools=tools, input=openai_input)
 
             rounds = 0
@@ -332,7 +486,6 @@ async def on_message(message):
                 tool_outputs = await build_tool_outputs(response)
                 if not tool_outputs:
                     break
-
                 response = client.responses.create(
                     model="gpt-5.4-mini",
                     tools=tools,
@@ -345,11 +498,7 @@ async def on_message(message):
                 await message.reply("ツール呼び出しの上限に達したため、処理を中断しました。")
                 return
 
-            reply_text = (response.output_text or "").strip()
-            if not reply_text:
-                reply_text = "回答を生成できませんでした。"
-
-            # max 1900 characters
+            reply_text = (response.output_text or "").strip() or "回答を生成できませんでした。"
             reply_text = reply_text[:1900] + ("..." if len(reply_text) > 1900 else "")
             await message.reply(reply_text)
         except Exception as e:
@@ -359,6 +508,7 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
+# ---------- Voice helpers ----------
 async def play_audio_file_in_channel(target_channel: discord.VoiceChannel, audio_path: str):
     voice_client = discord.utils.get(bot.voice_clients, guild=target_channel.guild)
 
@@ -371,7 +521,7 @@ async def play_audio_file_in_channel(target_channel: discord.VoiceChannel, audio
         raise RuntimeError("現在ほかの音声を再生中です。")
 
     playback_done = asyncio.Event()
-    playback_error = {"error": None}
+    playback_error: dict = {"error": None}
 
     def after_playback(error):
         playback_error["error"] = error
@@ -469,7 +619,9 @@ def parse_timed_lines(script_text: str) -> list[tuple[int, str]]:
     return timed_lines
 
 
-async def synthesize_and_play_timeline(timed_lines: list[tuple[int, str]], target_channel_id: int, origin_time: float):
+async def synthesize_and_play_timeline(
+    timed_lines: list[tuple[int, str]], target_channel_id: int, origin_time: float
+):
     channel = bot.get_channel(target_channel_id)
     if not isinstance(channel, discord.VoiceChannel):
         raise RuntimeError(f"指定したチャンネルID {target_channel_id} はボイスチャンネルではありません。")
@@ -483,6 +635,7 @@ async def synthesize_and_play_timeline(timed_lines: list[tuple[int, str]], targe
         await play_audio_file_in_channel(channel, AUDIOFILE)
 
 
+# ---------- Discord commands ----------
 @bot.command()
 async def create_event(ctx, event_name: str, *date_strs: str):
     if not date_strs:
@@ -495,8 +648,7 @@ async def create_event(ctx, event_name: str, *date_strs: str):
 
     for date_str in date_strs:
         try:
-            full_date_str = f"{current_year}-{date_str}"
-            parsed_date = datetime.datetime.strptime(full_date_str, "%Y-%m-%d").date()
+            parsed_date = datetime.datetime.strptime(f"{current_year}-{date_str}", "%Y-%m-%d").date()
             valid_dates.append((date_str, parsed_date))
         except ValueError:
             invalid_inputs.append(date_str)
@@ -516,8 +668,7 @@ async def create_event(ctx, event_name: str, *date_strs: str):
 
     for _, event_date in unique_valid_dates:
         start_time_jst = datetime.datetime.combine(event_date, datetime.time(22, 0, 0))
-        start_time = start_time_jst - datetime.timedelta(hours=9)
-        start_time = start_time.replace(tzinfo=datetime.timezone.utc)
+        start_time = (start_time_jst - datetime.timedelta(hours=9)).replace(tzinfo=datetime.timezone.utc)
         end_time = start_time + datetime.timedelta(hours=2)
 
         try:
@@ -531,7 +682,8 @@ async def create_event(ctx, event_name: str, *date_strs: str):
                 entity_type=discord.EntityType.external,
             )
             success_messages.append(
-                f"- {event.name}: {start_time_jst.strftime('%Y-%m-%d %H:%M JST')} - {(start_time_jst + datetime.timedelta(hours=2)).strftime('%Y-%m-%d %H:%M JST')}"
+                f"- {event.name}: {start_time_jst.strftime('%Y-%m-%d %H:%M JST')} - "
+                f"{(start_time_jst + datetime.timedelta(hours=2)).strftime('%Y-%m-%d %H:%M JST')}"
             )
         except Exception as e:
             failed_messages.append(f"- {event_date.strftime('%Y-%m-%d')}: {e}")
@@ -551,10 +703,7 @@ async def create_event(ctx, event_name: str, *date_strs: str):
         response_lines.append("作成できなかった項目:")
         response_lines.extend(failed_messages)
 
-    if not response_lines:
-        response_lines.append("処理対象の日付がありませんでした。")
-
-    await ctx.send("\n".join(response_lines))
+    await ctx.send("\n".join(response_lines) or "処理対象の日付がありませんでした。")
 
 
 @bot.command()
@@ -574,203 +723,7 @@ async def play_test(ctx):
         await ctx.send(f"再生に失敗しました: {e}")
 
 
-def build_gui():
-    import tkinter as tk
-    from tkinter import scrolledtext
-
-    root = tk.Tk()
-    root.title("Discord Bot Controller")
-    root.geometry("560x380")
-
-    title = tk.Label(root, text="読み上げテキスト", anchor="w")
-    title.pack(fill="x", padx=12, pady=(12, 4))
-
-    offset_frame = tk.Frame(root)
-    offset_frame.pack(fill="x", padx=12, pady=(0, 8))
-    offset_label = tk.Label(offset_frame, text="再生開始オフセット秒数（正負の整数）")
-    offset_label.pack(side="left")
-    offset_entry = tk.Entry(offset_frame, width=8)
-    offset_entry.pack(side="left", padx=(8, 0))
-    offset_entry.insert(0, "0")
-
-    input_box = scrolledtext.ScrolledText(root, wrap=tk.WORD, height=10)
-    input_box.pack(fill="both", expand=True, padx=12)
-    input_box.insert("1.0", "00:00 ここに読み上げたいテキストを入力してください。")
-
-    status_var = tk.StringVar(value="Bot起動中...")
-    status = tk.Label(root, textvariable=status_var, anchor="w")
-    status.pack(fill="x", padx=12, pady=(8, 4))
-
-    button_frame = tk.Frame(root)
-    button_frame.pack(fill="x", padx=12, pady=(0, 12))
-
-    play_button = tk.Button(button_frame, text="再生")
-    play_button.pack(side="left", fill="x", expand=True)
-
-    stop_button = tk.Button(button_frame, text="再生停止")
-    stop_button.pack(side="left", fill="x", expand=True, padx=(8, 0))
-
-    leave_button = tk.Button(button_frame, text="VC退室")
-    leave_button.pack(side="left", fill="x", expand=True, padx=(8, 0))
-
-    playback_state = {"future": None}
-
-    def update_ui(
-            message: str,
-            enable_play: bool = True,
-            enable_stop: bool = False,
-            enable_leave: bool = True,
-            enable_offset: bool = True,
-    ):
-        status_var.set(message)
-        play_button.config(state=tk.NORMAL if enable_play else tk.DISABLED)
-        stop_button.config(state=tk.NORMAL if enable_stop else tk.DISABLED)
-        leave_button.config(state=tk.NORMAL if enable_leave else tk.DISABLED)
-        offset_entry.config(state=tk.NORMAL if enable_offset else tk.DISABLED)
-
-    def finish_playback(message: str):
-        playback_state["future"] = None
-        update_ui(message, enable_play=True, enable_stop=False, enable_leave=True, enable_offset=True)
-
-    def on_play_click():
-        current_future = playback_state["future"]
-        if current_future is not None and not current_future.done():
-            update_ui(
-                "すでに再生中です。停止してから再実行してください。",
-                enable_play=False,
-                enable_stop=True,
-                enable_leave=False,
-                enable_offset=False,
-            )
-            return
-
-        text = input_box.get("1.0", tk.END)
-
-        try:
-            timed_lines = parse_timed_lines(text)
-        except RuntimeError as e:
-            update_ui(str(e))
-            return
-
-        if not bot_ready_event.is_set():
-            update_ui("Botの接続完了を待っています。")
-            return
-
-        offset_raw = offset_entry.get().strip()
-        if offset_raw == "":
-            offset_seconds = 0
-        else:
-            try:
-                offset_seconds = int(offset_raw)
-            except ValueError:
-                update_ui("オフセット秒数は正負の整数で入力してください。")
-                return
-
-        origin_time = time.monotonic() + offset_seconds
-        update_ui(
-            f"スケジュール再生を開始しました... (オフセット: {offset_seconds:+d}秒)",
-            enable_play=False,
-            enable_stop=True,
-            enable_leave=False,
-            enable_offset=False,
-        )
-        future = asyncio.run_coroutine_threadsafe(
-            synthesize_and_play_timeline(timed_lines, VOICE_CHANNEL_ID, origin_time),
-            bot.loop,
-        )
-        playback_state["future"] = future
-
-        def done_callback(done_future):
-            try:
-                done_future.result()
-                root.after(0, lambda: finish_playback("再生が完了しました。"))
-            except concurrent.futures.CancelledError:
-                root.after(0, lambda: finish_playback("再生を中断しました。"))
-            except Exception as e:
-                root.after(0, lambda: finish_playback(f"再生に失敗しました: {e}"))
-
-        future.add_done_callback(done_callback)
-
-    def on_stop_click():
-        if not bot_ready_event.is_set():
-            update_ui("Botの接続完了を待っています。")
-            return
-
-        current_future = playback_state["future"]
-        has_running_timeline = current_future is not None and not current_future.done()
-        if has_running_timeline:
-            current_future.cancel()
-
-        update_ui("再生を停止しています...", enable_play=False, enable_stop=False, enable_leave=False,
-                  enable_offset=False)
-        future = asyncio.run_coroutine_threadsafe(stop_current_playback(VOICE_CHANNEL_ID), bot.loop)
-
-        def done_callback(done_future):
-            try:
-                stopped_now = done_future.result()
-                if has_running_timeline:
-                    return
-                if stopped_now:
-                    root.after(0, lambda: update_ui("現在の再生を停止しました。", enable_play=True, enable_stop=False,
-                                                    enable_leave=True, enable_offset=True))
-                else:
-                    root.after(0, lambda: update_ui("停止対象の再生はありません。", enable_play=True, enable_stop=False,
-                                                    enable_leave=True, enable_offset=True))
-            except Exception as e:
-                root.after(0, lambda: update_ui(f"停止に失敗しました: {e}", enable_play=True, enable_stop=False,
-                                                enable_leave=True, enable_offset=True))
-
-        future.add_done_callback(done_callback)
-
-    def on_leave_click():
-        if not bot_ready_event.is_set():
-            update_ui("Botの接続完了を待っています。")
-            return
-
-        current_future = playback_state["future"]
-        if current_future is not None and not current_future.done():
-            current_future.cancel()
-
-        update_ui("VCから退室しています...", enable_play=False, enable_stop=False, enable_leave=False,
-                  enable_offset=False)
-        future = asyncio.run_coroutine_threadsafe(leave_voice_channel(VOICE_CHANNEL_ID), bot.loop)
-
-        def done_callback(done_future):
-            try:
-                playback_state["future"] = None
-                disconnected = done_future.result()
-                if disconnected:
-                    root.after(0, lambda: update_ui("VCから退室しました。", enable_play=True, enable_stop=False,
-                                                    enable_leave=True, enable_offset=True))
-                else:
-                    root.after(0, lambda: update_ui("BotはVCに接続していません。", enable_play=True, enable_stop=False,
-                                                    enable_leave=True, enable_offset=True))
-            except Exception as e:
-                root.after(0, lambda: update_ui(f"VC退室に失敗しました: {e}", enable_play=True, enable_stop=False,
-                                                enable_leave=True, enable_offset=True))
-
-        future.add_done_callback(done_callback)
-
-    def on_close():
-        current_future = playback_state["future"]
-        if current_future is not None and not current_future.done():
-            current_future.cancel()
-
-        if bot_ready_event.is_set() and not bot.is_closed():
-            try:
-                asyncio.run_coroutine_threadsafe(bot.close(), bot.loop).result(timeout=5)
-            except Exception as e:
-                print(f"[WARN] bot.close failed: {e}")
-        root.destroy()
-
-    play_button.config(command=on_play_click)
-    stop_button.config(command=on_stop_click)
-    leave_button.config(command=on_leave_click)
-    update_ui("Bot起動中...", enable_play=True, enable_stop=False, enable_leave=True)
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.mainloop()
-
-
+# ---------- Startup helpers ----------
 def start_bot_in_background():
     def run_bot():
         bot.run(TOKEN)
@@ -783,27 +736,24 @@ def start_bot_in_background():
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Discord event bot runner")
     parser.add_argument(
-        "--tts",
+        "--web",
         action="store_true",
-        help="CeVIO TTS と GUI コントローラーを有効化します。",
+        help="Webコントローラーを有効化します（ポートは WEB_PORT 環境変数、デフォルト 8080）。",
     )
     return parser.parse_args(argv)
-
-
-def run_bot_forever():
-    bot.run(TOKEN)
 
 
 def main(argv=None):
     args = parse_args(argv)
 
-    if args.tts:
+
+    if args.web:
         start_cevio()
         start_bot_in_background()
-        build_gui()
-        return
-
-    run_bot_forever()
+        print(f"[INFO] Web controller starting on http://0.0.0.0:{WEB_PORT}")
+        uvicorn.run(app, host="0.0.0.0", port=WEB_PORT)
+    else:
+        bot.run(TOKEN)
 
 
 if __name__ == "__main__":

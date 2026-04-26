@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Discord Bot Controller</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="card">
+  <h1>🎙️ Discord Bot Controller</h1>
+
+  <label for="script">読み上げスクリプト（MM:SS テキスト 形式、1行1エントリ）</label>
+  <textarea id="script" placeholder="00:00 ここに読み上げたいテキストを入力してください。
+00:30 2行目のテキスト"></textarea>
+
+  <div class="offset-row">
+    <label for="offset">再生開始オフセット秒数（正負の整数）</label>
+    <input id="offset" type="number" value="0" step="1" />
+  </div>
+
+  <div class="status-bar">
+    <div class="dot idle" id="dot"></div>
+    <span id="status-text">接続中...</span>
+  </div>
+
+  <div class="buttons">
+    <button id="btn-play"  disabled>▶ 再生</button>
+    <button id="btn-stop"  disabled>■ 再生停止</button>
+    <button id="btn-leave" disabled>✕ VC退室</button>
+  </div>
+
+  <div class="ws-badge"><span id="ws-dot"></span>WebSocket</div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
+
