@@ -6,5 +6,6 @@ docling
 readability-lxml
 pywin32
 torch
+transformers
 fastapi
 uvicorn[standard]
