@@ -324,31 +324,18 @@ async def get_webpage(url: str) -> str:
 
     def fetch_and_extract() -> str:
         try:
-            import requests
-            from readability import Document
+            from docling.document_converter import DocumentConverter
         except Exception as exc:
             return f"依存ライブラリの読み込みに失敗しました: {exc}"
 
         try:
-            response = requests.get(
-                target_url,
-                timeout=15,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; DiscordEventTool/1.0)"},
-            )
-            response.raise_for_status()
-        except requests.RequestException as exc:
+            converter = DocumentConverter()
+            doc = converter.convert(target_url).document
+            # print(doc.export_to_markdown())
+        except Exception as exc:
             return f"Webページの取得に失敗しました: {exc}"
 
-        html = response.text
-        if not html.strip():
-            return "Webページの内容が空でした。"
-
-        try:
-            doc = Document(html)
-            text = doc.summary(html_partial=True)
-        except Exception as exc:
-            return f"本文抽出に失敗しました: {exc}"
-
+        text = doc.export_to_markdown()
         normalized = "\n".join(line for line in (x.strip() for x in text.splitlines()) if line)
         return normalized if normalized else "本文を抽出できませんでした。"
 
