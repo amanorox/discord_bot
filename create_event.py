@@ -319,6 +319,7 @@ async def get_webpage(url: str) -> str:
         return "URLが空です。"
 
     target_url = url.strip()
+    print(target_url)
     if not (target_url.startswith("http://") or target_url.startswith("https://")):
         return "URLは http:// または https:// で始めてください。"
 
