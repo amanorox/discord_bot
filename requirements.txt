@@ -4,8 +4,9 @@ python-dotenv
 requests
 docling
 readability-lxml
-pywin32
+pywin32  # Windows only (CeVIO backend)
 torch
 transformers
 fastapi
 uvicorn[standard]
+soundfile

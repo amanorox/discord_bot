@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from cevio_tts import VoiceParams, save_wave, start_cevio
+from tts_backend import VoiceParams, get_backend
 
 load_dotenv()
 
@@ -563,7 +563,7 @@ async def synthesize_and_play(text: str, target_channel_id: int):
     if not isinstance(channel, discord.VoiceChannel):
         raise RuntimeError(f"指定したチャンネルID {target_channel_id} はボイスチャンネルではありません。")
 
-    await asyncio.to_thread(save_wave, text, output_path=AUDIOFILE, params=VoiceParams(speed=55))
+    await asyncio.to_thread(get_backend().save_wave, text, AUDIOFILE, params=VoiceParams(speed=55))
     await play_audio_file_in_channel(channel, AUDIOFILE)
 
 
@@ -619,7 +619,7 @@ async def synthesize_and_play_timeline(
         if remaining > 0:
             await asyncio.sleep(remaining)
 
-        await asyncio.to_thread(save_wave, text, output_path=AUDIOFILE, params=VoiceParams(speed=55))
+        await asyncio.to_thread(get_backend().save_wave, text, AUDIOFILE, params=VoiceParams(speed=55))
         await play_audio_file_in_channel(channel, AUDIOFILE)
 
 
@@ -736,7 +736,7 @@ def main(argv=None):
 
 
     if args.web:
-        start_cevio()
+        get_backend().start()
         start_bot_in_background()
         print(f"[INFO] Web controller starting on http://0.0.0.0:{WEB_PORT}")
         uvicorn.run(app, host="0.0.0.0", port=WEB_PORT)
