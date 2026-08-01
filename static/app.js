@@ -11,9 +11,69 @@ const selectEl   = document.getElementById('script-select');
 const btnSave    = document.getElementById('btn-save');
 const btnLoad    = document.getElementById('btn-load');
 const btnDelete  = document.getElementById('btn-delete');
+const channelSelectEl = document.getElementById('channel-select');
 
 let isPlaying = false;
 let botReady  = false;
+
+// ---------- Voice channel selection (localStorage) ----------
+const LAST_CHANNEL_KEY = 'discordBotController.lastChannelId';
+
+function getSavedChannelId() {
+  const raw = localStorage.getItem(LAST_CHANNEL_KEY);
+  return raw ? raw : '';
+}
+
+function saveChannelId(channelId) {
+  if (channelId) {
+    localStorage.setItem(LAST_CHANNEL_KEY, String(channelId));
+  }
+}
+
+function getSelectedChannelId() {
+  // Keep as string: Discord snowflake IDs exceed JS Number safe-integer
+  // range, so converting to a Number here would lose precision.
+  const value = channelSelectEl.value;
+  return value ? value : null;
+}
+
+async function loadVoiceChannels() {
+  try {
+    const res = await fetch('/voice_channels');
+    if (!res.ok) {
+      channelSelectEl.innerHTML = '<option value="">-- 取得失敗 --</option>';
+      return;
+    }
+    const data = await res.json();
+    if (!data.ok) {
+      channelSelectEl.innerHTML = '<option value="">-- 取得失敗 --</option>';
+      return;
+    }
+
+    const savedId = getSavedChannelId();
+    const defaultId = String(data.default_channel_id);
+    channelSelectEl.innerHTML = '';
+    for (const ch of data.channels) {
+      const opt = document.createElement('option');
+      opt.value = String(ch.id);
+      opt.textContent = `${ch.guild_name} / ${ch.name}`;
+      channelSelectEl.appendChild(opt);
+    }
+
+    const idToSelect = [...channelSelectEl.options].some(o => o.value === savedId)
+      ? savedId
+      : ([...channelSelectEl.options].some(o => o.value === defaultId) ? defaultId : '');
+    if (idToSelect) {
+      channelSelectEl.value = idToSelect;
+    }
+  } catch (e) {
+    channelSelectEl.innerHTML = '<option value="">-- 取得失敗 --</option>';
+  }
+}
+
+channelSelectEl.addEventListener('change', () => {
+  saveChannelId(channelSelectEl.value);
+});
 
 // ---------- Saved scripts (localStorage) ----------
 const STORAGE_KEY = 'discordBotController.savedScripts';
@@ -159,20 +219,23 @@ btnPlay.addEventListener('click', async () => {
   const script   = scriptEl.value.trim();
   const offsetRaw = offsetEl.value.trim();
   const offset   = offsetRaw === '' ? 0 : parseInt(offsetRaw, 10);
+  const channelId = getSelectedChannelId();
 
   if (!script)     { setStatus('スクリプトを入力してください。', 'error'); return; }
   if (isNaN(offset)) { setStatus('オフセット秒数は整数で入力してください。', 'error'); return; }
+  if (!channelId)  { setStatus('参加するボイスチャンネルを選択してください。', 'error'); return; }
 
   btnPlay.disabled = true;
   setStatus('再生リクエスト送信中...', 'busy');
 
   try {
-    const data = await apiPost('/play', { script, offset });
+    const data = await apiPost('/play', { script, offset, channel_id: channelId });
     if (!data.ok) {
       setStatus(data.message, 'error');
       isPlaying = false;
     } else {
       isPlaying = true;
+      saveChannelId(channelId);
     }
   } catch (e) {
     setStatus(`通信エラー: ${e}`, 'error');
@@ -185,7 +248,7 @@ btnStop.addEventListener('click', async () => {
   btnStop.disabled = true;
   setStatus('停止リクエスト送信中...', 'busy');
   try {
-    const data = await apiPost('/stop');
+    const data = await apiPost('/stop', { channel_id: getSelectedChannelId() });
     setStatus(data.message, data.ok ? 'idle' : 'error');
     isPlaying = false;
   } catch (e) {
@@ -198,7 +261,7 @@ btnLeave.addEventListener('click', async () => {
   btnLeave.disabled = true;
   setStatus('退室リクエスト送信中...', 'busy');
   try {
-    const data = await apiPost('/leave');
+    const data = await apiPost('/leave', { channel_id: getSelectedChannelId() });
     setStatus(data.message, data.ok ? 'idle' : 'error');
     isPlaying = false;
   } catch (e) {
@@ -211,4 +274,4 @@ btnLeave.addEventListener('click', async () => {
 connectWS();
 pollStatus();
 refreshScriptSelect();
-
+loadVoiceChannels();

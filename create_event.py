@@ -94,10 +94,28 @@ async def status():
     })
 
 
-class PlayRequest:
-    def __init__(self, script: str, offset: int = 0):
-        self.script = script
-        self.offset = offset
+@app.get("/voice_channels")
+async def api_voice_channels():
+    if not bot_ready_event.is_set():
+        return JSONResponse({"ok": False, "message": "Botの接続完了を待っています。"}, status_code=503)
+
+    channels: list[dict] = []
+    for guild in bot.guilds:
+        for channel in guild.voice_channels:
+            channels.append({
+                # Discord snowflake IDs exceed JS Number safe-integer range,
+                # so serialize as string to avoid precision loss in the browser.
+                "id": str(channel.id),
+                "name": channel.name,
+                "guild_name": guild.name,
+            })
+
+    channels.sort(key=lambda c: (c["guild_name"], c["name"]))
+    return JSONResponse({
+        "ok": True,
+        "channels": channels,
+        "default_channel_id": str(VOICE_CHANNEL_ID),
+    })
 
 
 from pydantic import BaseModel
@@ -106,6 +124,22 @@ from pydantic import BaseModel
 class PlayBody(BaseModel):
     script: str
     offset: int = 0
+    # Accept as string from the frontend to avoid JS float precision loss on
+    # large Discord snowflake IDs; Python's int() keeps full precision.
+    channel_id: str | int | None = None
+
+
+class ChannelActionBody(BaseModel):
+    channel_id: str | int | None = None
+
+
+def resolve_channel_id(channel_id: str | int | None) -> int:
+    if channel_id is None or channel_id == "":
+        return VOICE_CHANNEL_ID
+    try:
+        return int(channel_id)
+    except (TypeError, ValueError):
+        return VOICE_CHANNEL_ID
 
 
 @app.post("/play")
@@ -122,11 +156,12 @@ async def api_play(body: PlayBody):
     except RuntimeError as e:
         return JSONResponse({"ok": False, "message": str(e)}, status_code=400)
 
+    target_channel_id = resolve_channel_id(body.channel_id)
     origin_time = time.monotonic() + body.offset
     await broadcast_status(f"スケジュール再生を開始しました... (オフセット: {body.offset:+d}秒)", True)
 
     future = asyncio.run_coroutine_threadsafe(
-        synthesize_and_play_timeline(timed_lines, VOICE_CHANNEL_ID, origin_time),
+        synthesize_and_play_timeline(timed_lines, target_channel_id, origin_time),
         bot.loop,
     )
     web_playback_state["future"] = future
@@ -148,7 +183,7 @@ async def api_play(body: PlayBody):
 
 
 @app.post("/stop")
-async def api_stop():
+async def api_stop(body: ChannelActionBody):
     if not bot_ready_event.is_set():
         return JSONResponse({"ok": False, "message": "Botの接続完了を待っています。"}, status_code=503)
 
@@ -159,8 +194,9 @@ async def api_stop():
 
     await broadcast_status("再生を停止しています...", False)
 
+    target_channel_id = resolve_channel_id(body.channel_id)
     loop = bot.loop
-    future = asyncio.run_coroutine_threadsafe(stop_current_playback(VOICE_CHANNEL_ID), loop)
+    future = asyncio.run_coroutine_threadsafe(stop_current_playback(target_channel_id), loop)
     try:
         stopped = future.result(timeout=10)
     except Exception as exc:
@@ -175,7 +211,7 @@ async def api_stop():
 
 
 @app.post("/leave")
-async def api_leave():
+async def api_leave(body: ChannelActionBody):
     if not bot_ready_event.is_set():
         return JSONResponse({"ok": False, "message": "Botの接続完了を待っています。"}, status_code=503)
 
@@ -186,7 +222,8 @@ async def api_leave():
 
     await broadcast_status("VCから退室しています...", False)
 
-    future = asyncio.run_coroutine_threadsafe(leave_voice_channel(VOICE_CHANNEL_ID), bot.loop)
+    target_channel_id = resolve_channel_id(body.channel_id)
+    future = asyncio.run_coroutine_threadsafe(leave_voice_channel(target_channel_id), bot.loop)
     try:
         disconnected = future.result(timeout=10)
     except Exception as exc:
