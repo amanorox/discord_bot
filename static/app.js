@@ -1,14 +1,82 @@
-const scriptEl = document.getElementById('script');
-const offsetEl = document.getElementById('offset');
-const statusEl = document.getElementById('status-text');
-const dotEl    = document.getElementById('dot');
-const wsDotEl  = document.getElementById('ws-dot');
-const btnPlay  = document.getElementById('btn-play');
-const btnStop  = document.getElementById('btn-stop');
-const btnLeave = document.getElementById('btn-leave');
+const scriptEl   = document.getElementById('script');
+const offsetEl   = document.getElementById('offset');
+const statusEl   = document.getElementById('status-text');
+const dotEl      = document.getElementById('dot');
+const wsDotEl    = document.getElementById('ws-dot');
+const btnPlay    = document.getElementById('btn-play');
+const btnStop    = document.getElementById('btn-stop');
+const btnLeave   = document.getElementById('btn-leave');
+const nameEl     = document.getElementById('script-name');
+const selectEl   = document.getElementById('script-select');
+const btnSave    = document.getElementById('btn-save');
+const btnLoad    = document.getElementById('btn-load');
+const btnDelete  = document.getElementById('btn-delete');
 
 let isPlaying = false;
 let botReady  = false;
+
+// ---------- Saved scripts (localStorage) ----------
+const STORAGE_KEY = 'discordBotController.savedScripts';
+
+function loadSavedScripts() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function persistSavedScripts(scripts) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(scripts));
+}
+
+function refreshScriptSelect(selectName = '') {
+  const scripts = loadSavedScripts();
+  const names = Object.keys(scripts).sort((a, b) => a.localeCompare(b, 'ja'));
+  selectEl.innerHTML = '<option value="">-- 選択 --</option>';
+  for (const name of names) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    selectEl.appendChild(opt);
+  }
+  if (selectName && names.includes(selectName)) {
+    selectEl.value = selectName;
+  }
+}
+
+btnSave.addEventListener('click', () => {
+  const name = nameEl.value.trim();
+  if (!name) { setStatus('スクリプト名を入力してください。', 'error'); return; }
+  const scripts = loadSavedScripts();
+  scripts[name] = { script: scriptEl.value, offset: offsetEl.value };
+  persistSavedScripts(scripts);
+  refreshScriptSelect(name);
+  setStatus(`「${name}」を保存しました。`, 'idle');
+});
+
+btnLoad.addEventListener('click', () => {
+  const name = selectEl.value;
+  if (!name) { setStatus('ロードするスクリプトを選択してください。', 'error'); return; }
+  const scripts = loadSavedScripts();
+  const entry = scripts[name];
+  if (!entry) { setStatus('選択したスクリプトが見つかりません。', 'error'); return; }
+  scriptEl.value = entry.script ?? '';
+  offsetEl.value = entry.offset ?? 0;
+  nameEl.value = name;
+  setStatus(`「${name}」をロードしました。`, 'idle');
+});
+
+btnDelete.addEventListener('click', () => {
+  const name = selectEl.value;
+  if (!name) { setStatus('削除するスクリプトを選択してください。', 'error'); return; }
+  const scripts = loadSavedScripts();
+  delete scripts[name];
+  persistSavedScripts(scripts);
+  refreshScriptSelect();
+  setStatus(`「${name}」を削除しました。`, 'idle');
+});
 
 // ---------- UI helpers ----------
 function setStatus(message, state /* 'idle' | 'busy' | 'error' */ = 'idle') {
@@ -142,4 +210,5 @@ btnLeave.addEventListener('click', async () => {
 // ---------- Boot ----------
 connectWS();
 pollStatus();
+refreshScriptSelect();
 

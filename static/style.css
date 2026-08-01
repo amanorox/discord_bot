@@ -50,6 +50,45 @@ textarea {
 }
 textarea:focus { border-color: #5865f2; }
 
+.save-row {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.save-row-field {
+  flex: 1;
+  min-width: 0;
+}
+.save-row-field label { margin: 0 0 6px; }
+#script-name,
+#script-select {
+  width: 100%;
+  background: #1e1f22;
+  color: #dcddde;
+  border: 1px solid #3f4248;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: .85rem;
+  outline: none;
+  transition: border-color .15s;
+}
+#script-name:focus,
+#script-select:focus { border-color: #5865f2; }
+
+.save-buttons {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+.save-buttons button {
+  flex: 1;
+  padding: 8px 0;
+  font-size: .8rem;
+}
+#btn-save   { background: #3ba55d; color: #fff; }
+#btn-load   { background: #4f545c; color: #fff; }
+#btn-delete { background: #4f545c; color: #fff; }
+
 .offset-row {
   display: flex;
   align-items: center;

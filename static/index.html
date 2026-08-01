@@ -10,6 +10,24 @@
 <div class="card">
   <h1>🎙️ Discord Bot Controller</h1>
 
+  <div class="save-row">
+    <div class="save-row-field">
+      <label for="script-name">スクリプト名</label>
+      <input id="script-name" type="text" placeholder="保存名を入力" />
+    </div>
+    <div class="save-row-field">
+      <label for="script-select">保存済みスクリプト</label>
+      <select id="script-select">
+        <option value="">-- 選択 --</option>
+      </select>
+    </div>
+  </div>
+  <div class="save-buttons">
+    <button id="btn-save" type="button">💾 保存</button>
+    <button id="btn-load" type="button">📂 ロード</button>
+    <button id="btn-delete" type="button">🗑 削除</button>
+  </div>
+
   <label for="script">読み上げスクリプト（MM:SS テキスト 形式、1行1エントリ）</label>
   <textarea id="script" placeholder="00:00 ここに読み上げたいテキストを入力してください。
 00:30 2行目のテキスト"></textarea>
