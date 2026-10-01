@@ -504,7 +504,7 @@ async def on_message(message):
                 openai_input.append({"role": role, "content": chain_text})
 
             openai_input.append({"role": "user", "content": user_content})
-            response = client.responses.create(model="gpt-5.6-luna", tools=tools, input=openai_input)
+            response = client.responses.create(model="gpt-6-luna", tools=tools, input=openai_input)
 
             rounds = 0
             while rounds < MAX_TOOL_CALL_ROUNDS:
