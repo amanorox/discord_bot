@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import discord
@@ -437,6 +438,21 @@ def build_message_text_for_openai(message: discord.Message) -> str:
     return text
 
 
+def split_text_for_discord(text: str, limit: int = 1900) -> list[str]:
+    """Split text into chunks <= limit, preferring newline boundaries."""
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining.strip() or not chunks:
+        chunks.append(remaining)
+    return [c for c in chunks if c.strip()] or [text[:limit] or "回答を生成できませんでした。"]
+
+
 async def collect_reply_chain_messages(
     message: discord.Message, max_messages: int = MAX_REPLY_CHAIN_MESSAGES
 ) -> list[discord.Message]:
@@ -524,9 +540,12 @@ async def on_message(message):
                 return
 
             reply_text = (response.output_text or "").strip() or "回答を生成できませんでした。"
-            reply_text = reply_text[:1900] + ("..." if len(reply_text) > 1900 else "")
-            await message.reply(reply_text)
+            chunks = split_text_for_discord(reply_text)
+            await message.reply(chunks[0])
+            for chunk in chunks[1:]:
+                await message.channel.send(chunk)
         except Exception as e:
+            traceback.print_exc()
             print(f"Error: {e}")
             await message.channel.send(f"エラーが発生しました: {e}")
 
