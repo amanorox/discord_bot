@@ -512,7 +512,7 @@ async def on_message(message):
                 if not tool_outputs:
                     break
                 response = client.responses.create(
-                    model="gpt-5.6-luna",
+                    model="gpt-6-luna",
                     tools=tools,
                     previous_response_id=response.id,
                     input=tool_outputs,
