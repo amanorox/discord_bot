@@ -32,6 +32,10 @@ class TTSBackend(ABC):
     def start(self) -> None:  # noqa: B027
         """バックエンド起動処理（不要な場合は何もしない）。"""
 
+    def cache_id(self) -> str:
+        """音声キャッシュのキーに含めるバックエンド識別子（声や話者が変わると変わる）。"""
+        return type(self).__name__
+
     @abstractmethod
     def save_wave(
         self,
@@ -96,6 +100,9 @@ class VoicevoxBackend(TTSBackend):
     ) -> None:
         self._base_url = (base_url or os.getenv("VOICEVOX_URL", "http://localhost:50021")).rstrip("/")
         self._speaker = int(speaker or os.getenv("VOICEVOX_SPEAKER", "3"))
+
+    def cache_id(self) -> str:
+        return f"VoicevoxBackend:{self._speaker}"
 
     # VOICEVOX は起動済みのサービスを前提とするため start() は疎通確認のみ
     def start(self) -> None:
@@ -174,6 +181,9 @@ class GoogleTTSBackend(TTSBackend):
         self._voice = voice or os.getenv("GOOGLE_TTS_VOICE", "ja-JP-Neural2-B")
         self._language = language or os.getenv("GOOGLE_TTS_LANGUAGE", "ja-JP")
         self._client = None
+
+    def cache_id(self) -> str:
+        return f"GoogleTTSBackend:{self._language}:{self._voice}"
 
     def _get_client(self):
         if self._client is None:

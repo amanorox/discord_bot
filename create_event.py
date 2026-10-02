@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import datetime
+import hashlib
 import inspect
 import json
 import os
@@ -31,6 +32,19 @@ if not OPENAI_API_KEY:
     raise RuntimeError("環境変数 OPENAI_API_KEY が未設定です。")
 
 AUDIOFILE = "test.wav"
+WAV_DIR = Path(__file__).parent / "wav"
+TTS_PARAMS = VoiceParams(speed=55)
+
+
+def wav_path_for(text: str) -> Path:
+    """テキスト・TTSバックエンド・パラメータから決まるキャッシュ wav パス。"""
+    key = json.dumps(
+        [get_backend().cache_id(), text, vars(TTS_PARAMS)],
+        ensure_ascii=False, sort_keys=True, default=str,
+    )
+    return WAV_DIR / (hashlib.sha256(key.encode("utf-8")).hexdigest()[:24] + ".wav")
+
+
 VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID", "1482359368992161918"))
 WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 DEFAULT_FFMPEG = "C:\\Users\\amano\\AppData\\Local\\Microsoft\\WinGet\\Links\\ffmpeg.exe"
@@ -130,6 +144,41 @@ class PlayBody(BaseModel):
     channel_id: str | int | None = None
 
 
+class BuildBody(BaseModel):
+    script: str
+
+
+@app.post("/build")
+async def api_build(body: BuildBody):
+    if web_playback_state.get("building"):
+        return JSONResponse({"ok": False, "message": "すでにビルド中です。"}, status_code=409)
+
+    try:
+        timed_lines = parse_timed_lines(body.script)
+    except RuntimeError as e:
+        return JSONResponse({"ok": False, "message": str(e)}, status_code=400)
+
+    web_playback_state["building"] = True
+    loop = asyncio.get_running_loop()
+    await broadcast_status("ビルドを開始しました...", False)
+
+    def progress(msg: str) -> None:
+        asyncio.run_coroutine_threadsafe(broadcast_status(msg, False), loop)
+
+    try:
+        built, skipped = await asyncio.to_thread(build_wavs, timed_lines, progress)
+    except Exception as exc:
+        msg = f"ビルドに失敗しました: {exc}"
+        await broadcast_status(msg, False)
+        return JSONResponse({"ok": False, "message": msg}, status_code=500)
+    finally:
+        web_playback_state["building"] = False
+
+    msg = f"ビルド完了: 新規 {built} 件 / 既存 {skipped} 件 (wav/ に保存)"
+    await broadcast_status(msg, False)
+    return JSONResponse({"ok": True, "message": msg, "built": built, "skipped": skipped})
+
+
 class ChannelActionBody(BaseModel):
     channel_id: str | int | None = None
 
@@ -156,6 +205,16 @@ async def api_play(body: PlayBody):
         timed_lines = parse_timed_lines(body.script)
     except RuntimeError as e:
         return JSONResponse({"ok": False, "message": str(e)}, status_code=400)
+
+    if web_playback_state.get("building"):
+        return JSONResponse({"ok": False, "message": "ビルド中です。完了後に再実行してください。"}, status_code=409)
+
+    missing = [t for _, t in timed_lines if not wav_path_for(t).exists()]
+    if missing:
+        return JSONResponse(
+            {"ok": False, "message": f"未ビルドの音声が {len(set(missing))} 件あります。先に「ビルド」を押してください。"},
+            status_code=400,
+        )
 
     target_channel_id = resolve_channel_id(body.channel_id)
     origin_time = time.monotonic() + body.offset
@@ -619,8 +678,8 @@ async def synthesize_and_play(text: str, target_channel_id: int):
     if not isinstance(channel, discord.VoiceChannel):
         raise RuntimeError(f"指定したチャンネルID {target_channel_id} はボイスチャンネルではありません。")
 
-    await asyncio.to_thread(get_backend().save_wave, text, AUDIOFILE, params=VoiceParams(speed=55))
-    await play_audio_file_in_channel(channel, AUDIOFILE)
+    await asyncio.to_thread(build_wavs, [(0, text)])
+    await play_audio_file_in_channel(channel, str(wav_path_for(text)))
 
 
 def parse_timed_lines(script_text: str) -> list[tuple[int, str]]:
@@ -671,12 +730,35 @@ async def synthesize_and_play_timeline(
         raise RuntimeError(f"指定したチャンネルID {target_channel_id} はボイスチャンネルではありません。")
 
     for elapsed_seconds, text in timed_lines:
+        if not wav_path_for(text).exists():
+            raise RuntimeError(f"音声が未ビルドです。先に「ビルド」を実行してください: {text}")
+
+    for elapsed_seconds, text in timed_lines:
         remaining = origin_time + elapsed_seconds - time.monotonic()
         if remaining > 0:
             await asyncio.sleep(remaining)
 
-        await asyncio.to_thread(get_backend().save_wave, text, AUDIOFILE, params=VoiceParams(speed=55))
-        await play_audio_file_in_channel(channel, AUDIOFILE)
+        await play_audio_file_in_channel(channel, str(wav_path_for(text)))
+
+
+def build_wavs(timed_lines: list[tuple[int, str]], progress=None) -> tuple[int, int]:
+    """未生成の音声のみ TTS で合成し wav/ に保存する。(生成数, スキップ数) を返す。"""
+    WAV_DIR.mkdir(exist_ok=True)
+    backend = get_backend()
+    texts = list(dict.fromkeys(text for _, text in timed_lines))
+    built = skipped = 0
+    for i, text in enumerate(texts, start=1):
+        path = wav_path_for(text)
+        if path.exists():
+            skipped += 1
+        else:
+            tmp = path.with_suffix(".tmp.wav")
+            backend.save_wave(text, tmp, params=TTS_PARAMS)
+            os.replace(tmp, path)
+            built += 1
+        if progress:
+            progress(f"ビルド中... {i}/{len(texts)}")
+    return built, skipped
 
 
 # ---------- Discord commands ----------

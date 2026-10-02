@@ -5,6 +5,7 @@ const dotEl      = document.getElementById('dot');
 const wsDotEl    = document.getElementById('ws-dot');
 const btnPlay    = document.getElementById('btn-play');
 const btnStop    = document.getElementById('btn-stop');
+const btnBuild   = document.getElementById('btn-build');
 const btnLeave   = document.getElementById('btn-leave');
 const nameEl     = document.getElementById('script-name');
 const selectEl   = document.getElementById('script-select');
@@ -14,6 +15,7 @@ const btnDelete  = document.getElementById('btn-delete');
 const channelSelectEl = document.getElementById('channel-select');
 
 let isPlaying = false;
+let isBuilding = false;
 let botReady  = false;
 
 // ---------- Voice channel selection (localStorage) ----------
@@ -145,7 +147,8 @@ function setStatus(message, state /* 'idle' | 'busy' | 'error' */ = 'idle') {
 }
 
 function refreshButtons() {
-  btnPlay.disabled  = !botReady || isPlaying;
+  btnPlay.disabled  = !botReady || isPlaying || isBuilding;
+  btnBuild.disabled = isPlaying || isBuilding;
   btnStop.disabled  = !botReady || !isPlaying;
   btnLeave.disabled = !botReady || isPlaying;
 }
@@ -241,6 +244,23 @@ btnPlay.addEventListener('click', async () => {
     setStatus(`通信エラー: ${e}`, 'error');
     isPlaying = false;
   }
+  refreshButtons();
+});
+
+btnBuild.addEventListener('click', async () => {
+  const script = scriptEl.value.trim();
+  if (!script) { setStatus('スクリプトを入力してください。', 'error'); return; }
+
+  isBuilding = true;
+  refreshButtons();
+  setStatus('ビルド中...', 'busy');
+  try {
+    const data = await apiPost('/build', { script });
+    setStatus(data.message, data.ok ? 'idle' : 'error');
+  } catch (e) {
+    setStatus(`通信エラー: ${e}`, 'error');
+  }
+  isBuilding = false;
   refreshButtons();
 });
 
