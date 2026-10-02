@@ -3,7 +3,7 @@
 Supports CeVIO AI (Windows) and VOICEVOX Engine (cross-platform).
 
 Backend selection:
-  - 環境変数 TTS_BACKEND=cevio|voicevox で明示指定
+  - 環境変数 TTS_BACKEND=cevio|voicevox|google で明示指定
   - 未指定時: Windows → cevio, その他 → voicevox
 
 VOICEVOX 環境変数:
@@ -21,7 +21,7 @@ from typing import Optional
 from cevio_tts import VoiceParams
 
 # ---- VoiceParams は cevio_tts から再エクスポート ----
-__all__ = ["VoiceParams", "TTSBackend", "CevioBackend", "VoicevoxBackend", "get_backend"]
+__all__ = ["VoiceParams", "TTSBackend", "CevioBackend", "VoicevoxBackend", "GoogleTTSBackend", "get_backend"]
 
 PathLike = str | os.PathLike[str]
 
@@ -149,6 +149,88 @@ class VoicevoxBackend(TTSBackend):
 
 
 # ---------------------------------------------------------------------------
+# Google Cloud Text-to-Speech backend
+# ---------------------------------------------------------------------------
+
+class GoogleTTSBackend(TTSBackend):
+    """Google Cloud Text-to-Speech を使ったバックエンド。
+
+    認証: GOOGLE_APPLICATION_CREDENTIALS 環境変数（サービスアカウント JSON）。
+    環境変数:
+      GOOGLE_TTS_VOICE    (default: ja-JP-Neural2-B)
+      GOOGLE_TTS_LANGUAGE (default: ja-JP)
+    マッピング:
+      speaking_rate  = speed / 50 (0.25-4.0 にクランプ)
+      volume_gain_db = 20*log10(volume/50) (-96〜16 にクランプ)
+      pitch          = (tone - 50) / 50 * 10 (半音, -20〜20)
+    alpha は未対応。
+    """
+
+    def __init__(
+        self,
+        voice: Optional[str] = None,
+        language: Optional[str] = None,
+    ) -> None:
+        self._voice = voice or os.getenv("GOOGLE_TTS_VOICE", "ja-JP-Neural2-B")
+        self._language = language or os.getenv("GOOGLE_TTS_LANGUAGE", "ja-JP")
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from google.cloud import texttospeech  # type: ignore
+            from google.oauth2 import service_account
+            credentials = service_account.Credentials.from_service_account_file(
+                os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
+            )
+            self._client = texttospeech.TextToSpeechClient(credentials=credentials)
+        return self._client
+
+    def start(self) -> None:
+        try:
+            self._get_client()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Google Cloud TTS クライアントを初期化できません: {exc}"
+            ) from exc
+
+    def save_wave(
+        self,
+        text: str,
+        output_path: PathLike,
+        *,
+        params: Optional[VoiceParams] = None,
+    ) -> str:
+        import math
+        from google.cloud import texttospeech  # type: ignore
+
+        p = params or VoiceParams()
+        p.validate()
+
+        rate = min(max(p.speed / 50.0, 0.25), 4.0)
+        gain = -96.0 if p.volume <= 0 else 20 * math.log10(p.volume / 50.0)
+        gain = min(max(gain, -96.0), 16.0)
+        pitch = min(max((p.tone - 50) / 50.0 * 10.0, -20.0), 20.0)
+
+        response = self._get_client().synthesize_speech(
+            input=texttospeech.SynthesisInput(text=text),
+            voice=texttospeech.VoiceSelectionParams(
+                language_code=self._language, name=self._voice
+            ),
+            audio_config=texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+                speaking_rate=rate,
+                volume_gain_db=gain,
+                pitch=pitch,
+            ),
+        )
+
+        abs_path = os.path.abspath(str(output_path))
+        with open(abs_path, "wb") as f:
+            f.write(response.audio_content)
+        return abs_path
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -158,7 +240,7 @@ _backend_instance: Optional[TTSBackend] = None
 def get_backend() -> TTSBackend:
     """シングルトンで TTS バックエンドを返す。
 
-    TTS_BACKEND 環境変数で "cevio" / "voicevox" を指定可能。
+    TTS_BACKEND 環境変数で "cevio" / "voicevox" / "google" を指定可能。
     未指定時は Windows → CeVIO、それ以外 → VOICEVOX。
     """
     global _backend_instance
@@ -170,11 +252,12 @@ def get_backend() -> TTSBackend:
         _backend_instance = CevioBackend()
     elif env == "voicevox":
         _backend_instance = VoicevoxBackend()
+    elif env in ("google", "gcloud", "google_tts"):
+        _backend_instance = GoogleTTSBackend()
     elif sys.platform == "win32":
         _backend_instance = CevioBackend()
     else:
         _backend_instance = VoicevoxBackend()
 
     return _backend_instance
-
 

@@ -10,3 +10,4 @@ transformers
 fastapi
 uvicorn[standard]
 soundfile
+google-cloud-texttospeech
