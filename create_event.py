@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import concurrent.futures
 import datetime
 import hashlib
 import inspect
@@ -16,10 +15,8 @@ import openai
 import uvicorn
 from discord.ext import commands
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from tts_backend import VoiceParams, get_backend
+from web_api import WebController
 
 load_dotenv()
 
@@ -49,8 +46,6 @@ VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID", "1482359368992161918"))
 WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 DEFAULT_FFMPEG = "C:\\Users\\amano\\AppData\\Local\\Microsoft\\WinGet\\Links\\ffmpeg.exe"
 FFMPEG_EXECUTABLE = os.getenv("FFMPEG_PATH") or (DEFAULT_FFMPEG if os.path.exists(DEFAULT_FFMPEG) else "ffmpeg")
-STATIC_DIR = Path(__file__).parent / "static"
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -62,258 +57,8 @@ MAX_REPLY_CHAIN_MESSAGES = 10
 MAX_REPLY_MESSAGE_CHARS = 5000
 MAX_TOOL_CALL_ROUNDS = 5
 
-# ---------- Web server state ----------
+# ---------- Web controller state ----------
 web_playback_state: dict = {"future": None}
-ws_clients: set[WebSocket] = set()
-_ws_loop: asyncio.AbstractEventLoop | None = None
-
-
-async def broadcast_status(message: str, is_playing: bool) -> None:
-    payload = json.dumps({"message": message, "is_playing": is_playing})
-    dead: set[WebSocket] = set()
-    for ws in list(ws_clients):
-        try:
-            await ws.send_text(payload)
-        except Exception:
-            dead.add(ws)
-    ws_clients.difference_update(dead)
-
-
-def _schedule_broadcast(message: str, is_playing: bool) -> None:
-    """Thread-safe broadcast trigger from non-async context."""
-    if _ws_loop is not None and not _ws_loop.is_closed():
-        asyncio.run_coroutine_threadsafe(broadcast_status(message, is_playing), _ws_loop)
-
-
-# ---------- FastAPI app ----------
-app = FastAPI()
-
-STATIC_DIR.mkdir(exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-
-@app.get("/")
-async def index():
-    return FileResponse(str(STATIC_DIR / "index.html"))
-
-
-@app.get("/status")
-async def status():
-    is_playing = (
-        web_playback_state["future"] is not None
-        and not web_playback_state["future"].done()
-    )
-    return JSONResponse({
-        "bot_ready": bot_ready_event.is_set(),
-        "is_playing": is_playing,
-    })
-
-
-@app.get("/voice_channels")
-async def api_voice_channels():
-    if not bot_ready_event.is_set():
-        return JSONResponse({"ok": False, "message": "Botの接続完了を待っています。"}, status_code=503)
-
-    channels: list[dict] = []
-    for guild in bot.guilds:
-        for channel in guild.voice_channels:
-            channels.append({
-                # Discord snowflake IDs exceed JS Number safe-integer range,
-                # so serialize as string to avoid precision loss in the browser.
-                "id": str(channel.id),
-                "name": channel.name,
-                "guild_name": guild.name,
-            })
-
-    channels.sort(key=lambda c: (c["guild_name"], c["name"]))
-    return JSONResponse({
-        "ok": True,
-        "channels": channels,
-        "default_channel_id": str(VOICE_CHANNEL_ID),
-    })
-
-
-from pydantic import BaseModel
-
-
-class PlayBody(BaseModel):
-    script: str
-    offset: int = 0
-    # Accept as string from the frontend to avoid JS float precision loss on
-    # large Discord snowflake IDs; Python's int() keeps full precision.
-    channel_id: str | int | None = None
-
-
-class BuildBody(BaseModel):
-    script: str
-
-
-@app.post("/build")
-async def api_build(body: BuildBody):
-    if web_playback_state.get("building"):
-        return JSONResponse({"ok": False, "message": "すでにビルド中です。"}, status_code=409)
-
-    try:
-        timed_lines = parse_timed_lines(body.script)
-    except RuntimeError as e:
-        return JSONResponse({"ok": False, "message": str(e)}, status_code=400)
-
-    web_playback_state["building"] = True
-    loop = asyncio.get_running_loop()
-    await broadcast_status("ビルドを開始しました...", False)
-
-    def progress(msg: str) -> None:
-        asyncio.run_coroutine_threadsafe(broadcast_status(msg, False), loop)
-
-    try:
-        built, skipped = await asyncio.to_thread(build_wavs, timed_lines, progress)
-    except Exception as exc:
-        msg = f"ビルドに失敗しました: {exc}"
-        await broadcast_status(msg, False)
-        return JSONResponse({"ok": False, "message": msg}, status_code=500)
-    finally:
-        web_playback_state["building"] = False
-
-    msg = f"ビルド完了: 新規 {built} 件 / 既存 {skipped} 件 (wav/ に保存)"
-    await broadcast_status(msg, False)
-    return JSONResponse({"ok": True, "message": msg, "built": built, "skipped": skipped})
-
-
-class ChannelActionBody(BaseModel):
-    channel_id: str | int | None = None
-
-
-def resolve_channel_id(channel_id: str | int | None) -> int:
-    if channel_id is None or channel_id == "":
-        return VOICE_CHANNEL_ID
-    try:
-        return int(channel_id)
-    except (TypeError, ValueError):
-        return VOICE_CHANNEL_ID
-
-
-@app.post("/play")
-async def api_play(body: PlayBody):
-    if not bot_ready_event.is_set():
-        return JSONResponse({"ok": False, "message": "Botの接続完了を待っています。"}, status_code=503)
-
-    current = web_playback_state["future"]
-    if current is not None and not current.done():
-        return JSONResponse({"ok": False, "message": "すでに再生中です。停止してから再実行してください。"}, status_code=409)
-
-    try:
-        timed_lines = parse_timed_lines(body.script)
-    except RuntimeError as e:
-        return JSONResponse({"ok": False, "message": str(e)}, status_code=400)
-
-    if web_playback_state.get("building"):
-        return JSONResponse({"ok": False, "message": "ビルド中です。完了後に再実行してください。"}, status_code=409)
-
-    missing = [t for _, t in timed_lines if not wav_path_for(t).exists()]
-    if missing:
-        return JSONResponse(
-            {"ok": False, "message": f"未ビルドの音声が {len(set(missing))} 件あります。先に「ビルド」を押してください。"},
-            status_code=400,
-        )
-
-    target_channel_id = resolve_channel_id(body.channel_id)
-    origin_time = time.monotonic() + body.offset
-    await broadcast_status(f"スケジュール再生を開始しました... (オフセット: {body.offset:+d}秒)", True)
-
-    future = asyncio.run_coroutine_threadsafe(
-        synthesize_and_play_timeline(timed_lines, target_channel_id, origin_time),
-        bot.loop,
-    )
-    web_playback_state["future"] = future
-
-    def done_callback(done_future: concurrent.futures.Future):
-        try:
-            done_future.result()
-            web_playback_state["future"] = None
-            _schedule_broadcast("再生が完了しました。", False)
-        except concurrent.futures.CancelledError:
-            web_playback_state["future"] = None
-            _schedule_broadcast("再生を中断しました。", False)
-        except Exception as exc:
-            web_playback_state["future"] = None
-            _schedule_broadcast(f"再生に失敗しました: {exc}", False)
-
-    future.add_done_callback(done_callback)
-    return JSONResponse({"ok": True, "message": f"スケジュール再生を開始しました。(オフセット: {body.offset:+d}秒)"})
-
-
-@app.post("/stop")
-async def api_stop(body: ChannelActionBody):
-    if not bot_ready_event.is_set():
-        return JSONResponse({"ok": False, "message": "Botの接続完了を待っています。"}, status_code=503)
-
-    current = web_playback_state["future"]
-    has_running = current is not None and not current.done()
-    if has_running:
-        current.cancel()
-
-    await broadcast_status("再生を停止しています...", False)
-
-    target_channel_id = resolve_channel_id(body.channel_id)
-    loop = bot.loop
-    future = asyncio.run_coroutine_threadsafe(stop_current_playback(target_channel_id), loop)
-    try:
-        stopped = future.result(timeout=10)
-    except Exception as exc:
-        return JSONResponse({"ok": False, "message": f"停止に失敗しました: {exc}"}, status_code=500)
-
-    if has_running or stopped:
-        msg = "現在の再生を停止しました。"
-    else:
-        msg = "停止対象の再生はありません。"
-    await broadcast_status(msg, False)
-    return JSONResponse({"ok": True, "message": msg})
-
-
-@app.post("/leave")
-async def api_leave(body: ChannelActionBody):
-    if not bot_ready_event.is_set():
-        return JSONResponse({"ok": False, "message": "Botの接続完了を待っています。"}, status_code=503)
-
-    current = web_playback_state["future"]
-    if current is not None and not current.done():
-        current.cancel()
-    web_playback_state["future"] = None
-
-    await broadcast_status("VCから退室しています...", False)
-
-    target_channel_id = resolve_channel_id(body.channel_id)
-    future = asyncio.run_coroutine_threadsafe(leave_voice_channel(target_channel_id), bot.loop)
-    try:
-        disconnected = future.result(timeout=10)
-    except Exception as exc:
-        return JSONResponse({"ok": False, "message": f"VC退室に失敗しました: {exc}"}, status_code=500)
-
-    msg = "VCから退室しました。" if disconnected else "BotはVCに接続していません。"
-    await broadcast_status(msg, False)
-    return JSONResponse({"ok": True, "message": msg})
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    global _ws_loop
-    _ws_loop = asyncio.get_event_loop()
-    await websocket.accept()
-    ws_clients.add(websocket)
-    is_playing = (
-        web_playback_state["future"] is not None
-        and not web_playback_state["future"].done()
-    )
-    await websocket.send_text(json.dumps({
-        "message": "接続しました。" if bot_ready_event.is_set() else "Bot起動中...",
-        "is_playing": is_playing,
-    }))
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        ws_clients.discard(websocket)
-
 
 # ---------- OpenAI tools ----------
 tools = [
@@ -759,6 +504,23 @@ def build_wavs(timed_lines: list[tuple[int, str]], progress=None) -> tuple[int, 
         if progress:
             progress(f"ビルド中... {i}/{len(texts)}")
     return built, skipped
+
+
+web_controller = WebController(
+    bot=bot,
+    bot_ready_event=bot_ready_event,
+    default_channel_id=VOICE_CHANNEL_ID,
+    static_dir=Path(__file__).parent / "static",
+    playback_state=web_playback_state,
+    parse_timed_lines=parse_timed_lines,
+    build_wavs=build_wavs,
+    wav_path_for=wav_path_for,
+    synthesize_and_play_timeline=synthesize_and_play_timeline,
+    stop_current_playback=stop_current_playback,
+    leave_voice_channel=leave_voice_channel,
+)
+app = web_controller.app
+_schedule_broadcast = web_controller.schedule_broadcast
 
 
 # ---------- Discord commands ----------
