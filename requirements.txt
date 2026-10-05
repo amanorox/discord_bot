@@ -1,5 +1,6 @@
 discord.py
 openai
+openai-agents
 python-dotenv
 requests
 docling

@@ -2,7 +2,6 @@ import argparse
 import asyncio
 import datetime
 import hashlib
-import inspect
 import json
 import os
 import threading
@@ -11,7 +10,7 @@ import traceback
 from pathlib import Path
 
 import discord
-import openai
+from agents import Agent, MaxTurnsExceeded, Runner, function_tool, set_default_openai_key
 import uvicorn
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -50,7 +49,8 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+set_default_openai_key(OPENAI_API_KEY)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-6-luna")
 
 bot_ready_event = threading.Event()
 MAX_REPLY_CHAIN_MESSAGES = 10
@@ -60,103 +60,16 @@ MAX_TOOL_CALL_ROUNDS = 5
 # ---------- Web controller state ----------
 web_playback_state: dict = {"future": None}
 
-# ---------- OpenAI tools ----------
-tools = [
-    {
-        "type": "function",
-        "name": "list_all_event",
-        "description": "Get all scheduled events. 作成済みのイベント一覧を取得します。",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
-        "name": "get_webpage",
-        "description": "Fetch and extract readable main text from a webpage. Webページの本文テキストを取得します。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "Target page URL (http/https).",
-                }
-            },
-            "required": ["url"],
-            "additionalProperties": False,
-        },
-    }
-]
+# ---------- OpenAI Agents SDK tools ----------
 
 
-def parse_tool_arguments(arguments_raw) -> dict:
-    if arguments_raw is None:
-        return {}
-    if isinstance(arguments_raw, dict):
-        return arguments_raw
-    if not isinstance(arguments_raw, str):
-        raise RuntimeError("ツール引数の形式が不正です。")
-    text = arguments_raw.strip()
-    if not text:
-        return {}
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("ツール引数のJSON解析に失敗しました。") from exc
-    if not isinstance(parsed, dict):
-        raise RuntimeError("ツール引数はJSONオブジェクトである必要があります。")
-    return parsed
-
-
-async def build_tool_outputs(response) -> list[dict[str, str]]:
-    tool_outputs: list[dict[str, str]] = []
-
-    for item in getattr(response, "output", []):
-        if getattr(item, "type", None) != "function_call":
-            continue
-
-        call_id = getattr(item, "call_id", None)
-        tool_name = getattr(item, "name", "")
-        arguments_raw = getattr(item, "arguments", None)
-
-        if not call_id:
-            continue
-
-        tool_fn = TOOL_REGISTRY.get(tool_name)
-        if tool_fn is None:
-            tool_outputs.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": f"未対応のツールです: {tool_name}",
-                }
-            )
-            continue
-
-        try:
-            args = parse_tool_arguments(arguments_raw)
-            result = tool_fn(**args) if args else tool_fn()
-            if inspect.isawaitable(result):
-                result = await result
-            output = str(result)
-        except Exception as exc:
-            output = f"ツール実行中にエラーが発生しました: {exc}"
-
-        tool_outputs.append(
-            {
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": output,
-            }
-        )
-
-    return tool_outputs
-
-
+@function_tool
 async def get_webpage(url: str) -> str:
+    """Fetch and extract readable main text from a webpage. Webページの本文テキストを取得します。
+
+    Args:
+        url: Target page URL (http/https).
+    """
     if not isinstance(url, str) or not url.strip():
         return "URLが空です。"
 
@@ -185,7 +98,9 @@ async def get_webpage(url: str) -> str:
     return await asyncio.to_thread(fetch_and_extract)
 
 
+@function_tool
 async def list_all_event() -> str:
+    """Get all scheduled events. 作成済みのイベント一覧を取得します。"""
     if not bot_ready_event.is_set() or bot.user is None:
         return "Botの接続完了前のため、イベント一覧を取得できません。"
     if bot.is_closed():
@@ -210,7 +125,6 @@ async def list_all_event() -> str:
                 )
             )
 
-            lines.append(f"[{guild.name}]")
             for event in scheduled_events:
                 start_text = (
                     event.start_time.astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
@@ -227,12 +141,12 @@ async def list_all_event() -> str:
     return "\n".join(lines) if lines else "現在予定されているイベントはありません。"
 
 
-TOOL_REGISTRY = {
-    "list_all_event": list_all_event,
-    "get_webpage": get_webpage,
-}
-
-
+chat_agent = Agent(
+    name="Tranquility Bot",
+    instructions="You are a Discord bot for Final Fantasy XIV Guild Tranquility.",
+    model=OPENAI_MODEL,
+    tools=[list_all_event, get_webpage],
+)
 def build_message_text_for_openai(message: discord.Message) -> str:
     text = message.content.strip()
     if not text:
@@ -312,9 +226,7 @@ async def on_message(message):
                 return
 
             chain_messages = await collect_reply_chain_messages(message)
-            openai_input = [
-                {"role": "developer", "content": "You are a Discord bot for Final Fantasy XIV Guild Tranquility."}
-            ]
+            openai_input: list[dict] = []
 
             for chain_message in chain_messages:
                 chain_text = build_message_text_for_openai(chain_message)
@@ -324,26 +236,12 @@ async def on_message(message):
                 openai_input.append({"role": role, "content": chain_text})
 
             openai_input.append({"role": "user", "content": user_content})
-            response = client.responses.create(model="gpt-6-luna", tools=tools, input=openai_input)
-
-            rounds = 0
-            while rounds < MAX_TOOL_CALL_ROUNDS:
-                tool_outputs = await build_tool_outputs(response)
-                if not tool_outputs:
-                    break
-                response = client.responses.create(
-                    model="gpt-6-luna",
-                    tools=tools,
-                    previous_response_id=response.id,
-                    input=tool_outputs,
-                )
-                rounds += 1
-
-            if rounds >= MAX_TOOL_CALL_ROUNDS and await build_tool_outputs(response):
-                await message.reply("ツール呼び出しの上限に達したため、処理を中断しました。")
+            try:
+                result = await Runner.run(chat_agent, openai_input, max_turns=MAX_TOOL_CALL_ROUNDS + 1)
+            except MaxTurnsExceeded:
+                await message.reply("???????????????????????????")
                 return
-
-            reply_text = (response.output_text or "").strip() or "回答を生成できませんでした。"
+            reply_text = str(result.final_output or "").strip() or "回答を生成できませんでした。"
             chunks = split_text_for_discord(reply_text)
             await message.reply(chunks[0])
             for chunk in chunks[1:]:
