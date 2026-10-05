@@ -239,7 +239,7 @@ async def on_message(message):
             try:
                 result = await Runner.run(chat_agent, openai_input, max_turns=MAX_TOOL_CALL_ROUNDS + 1)
             except MaxTurnsExceeded:
-                await message.reply("???????????????????????????")
+                await message.reply("ツール呼び出しの上限に達したため、処理を中断しました。")
                 return
             reply_text = str(result.final_output or "").strip() or "回答を生成できませんでした。"
             chunks = split_text_for_discord(reply_text)
