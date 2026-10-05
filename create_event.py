@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import json
 import os
+import tempfile
 import threading
 import time
 import traceback
@@ -81,17 +82,34 @@ async def get_webpage(url: str) -> str:
     def fetch_and_extract() -> str:
         try:
             from docling.document_converter import DocumentConverter
+            from playwright.sync_api import sync_playwright
         except Exception as exc:
             return f"依存ライブラリの読み込みに失敗しました: {exc}"
 
+        # 1. Playwright (headless) でレンダリング済みHTMLを取得
         try:
-            converter = DocumentConverter()
-            doc = converter.convert(target_url).document
-            # print(doc.export_to_markdown())
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                try:
+                    page = browser.new_page()
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(3000)
+                    html = page.content()
+                finally:
+                    browser.close()
         except Exception as exc:
             return f"Webページの取得に失敗しました: {exc}"
 
-        text = doc.export_to_markdown()
+        # 2. Docling で Markdown に変換
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                html_path = Path(tmp_dir) / "page.html"
+                html_path.write_text(html, encoding="utf-8")
+                doc = DocumentConverter().convert(html_path).document
+                text = doc.export_to_markdown()
+        except Exception as exc:
+            return f"Markdownへの変換に失敗しました: {exc}"
+
         normalized = "\n".join(line for line in (x.strip() for x in text.splitlines()) if line)
         return normalized if normalized else "本文を抽出できませんでした。"
 

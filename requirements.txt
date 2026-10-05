@@ -4,6 +4,7 @@ openai-agents
 python-dotenv
 requests
 docling
+playwright
 readability-lxml
 pywin32  # Windows only (CeVIO backend)
 torch
