@@ -8,11 +8,13 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import discord
 from agents import Agent, MaxTurnsExceeded, Runner, function_tool, set_default_openai_key
 import uvicorn
 from discord.ext import commands
+from discord import app_commands
 from dotenv import load_dotenv
 from tts_backend import VoiceParams, get_backend
 from web_api import WebController
@@ -56,6 +58,276 @@ bot_ready_event = threading.Event()
 MAX_REPLY_CHAIN_MESSAGES = 10
 MAX_REPLY_MESSAGE_CHARS = 5000
 MAX_TOOL_CALL_ROUNDS = 5
+
+# ---------- Lightweight persistent scheduling polls ----------
+JST = ZoneInfo("Asia/Tokyo")
+POLL_STORE = Path(__file__).with_name("schedule_polls.json")
+schedule_polls: dict[str, dict] = {}
+
+
+def save_schedule_polls() -> None:
+    """Persist poll state atomically so polls survive a process restart."""
+    temporary = POLL_STORE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(schedule_polls, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, POLL_STORE)
+
+
+def load_schedule_polls() -> None:
+    global schedule_polls
+    try:
+        schedule_polls = json.loads(POLL_STORE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        schedule_polls = {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[WARN] 日程調整データを読み込めません: {exc}")
+        schedule_polls = {}
+
+
+def poll_is_open(poll: dict) -> bool:
+    deadline = poll.get("deadline")
+    return not poll.get("closed", False) and (not deadline or datetime.datetime.now(datetime.timezone.utc) < datetime.datetime.fromisoformat(deadline))
+
+
+def poll_embed(poll: dict, *, results: bool = False) -> discord.Embed:
+    candidates = poll["candidates"]
+    responses = poll.get("responses", {})
+    embed = discord.Embed(title=f"📅 {poll['title']}", color=0x5865F2)
+    embed.description = "候補日時（日本時間）\n" + "\n".join(
+        f"{i + 1}. {datetime.datetime.fromisoformat(value).astimezone(JST).strftime('%Y/%m/%d (%a) %H:%M')}"
+        for i, value in enumerate(candidates)
+    )
+    if poll.get("deadline"):
+        embed.description += "\n\n締切: " + datetime.datetime.fromisoformat(poll["deadline"]).astimezone(JST).strftime("%Y/%m/%d %H:%M JST")
+    counts = []
+    for i in range(len(candidates)):
+        answers = [values[i] for values in responses.values() if i < len(values)]
+        counts.append(f"{i + 1}: ○ {answers.count('○')}　△ {answers.count('△')}　× {answers.count('×')}")
+    embed.add_field(name="回答状況", value="\n".join(counts) or "回答なし", inline=False)
+    embed.set_footer(text=f"回答者 {len(responses)} 人 ・ {('締切済み' if not poll_is_open(poll) else '回答受付中')}")
+    if responses:
+        rows = [f"<@{user_id}>: " + " ".join(values) for user_id, values in responses.items()]
+        # Embed field values are limited to 1024 chars. The public result action
+        # below provides the complete list when it does not fit in this summary.
+        visible_rows = []
+        for row in rows:
+            addition = row if not visible_rows else "\n" + row
+            if len("".join(visible_rows) + addition) > 1000:
+                break
+            visible_rows.append(addition)
+        value = "".join(visible_rows)
+        omitted = len(rows) - len(visible_rows)
+        if omitted:
+            value += f"\nほか {omitted} 人（「結果を見る」で全員分を表示）"
+        embed.add_field(name="回答者別の回答", value=value or "回答あり", inline=False)
+    return embed
+
+
+class CandidateAnswerButton(discord.ui.Button):
+    def __init__(self, answer_view: "PollAnswerView", index: int, choice: str, label: str, style: discord.ButtonStyle, row: int):
+        selected = answer_view.values[index] == choice
+        super().__init__(label=("✓ " if selected else "") + label, style=style, row=row)
+        self.answer_view = answer_view
+        self.index = index
+        self.choice = choice
+
+    async def callback(self, interaction: discord.Interaction):
+        self.answer_view.values[self.index] = self.choice
+        self.answer_view.rebuild()
+        await interaction.response.edit_message(content=self.answer_view.prompt(), view=self.answer_view)
+
+
+class PollAnswerNavButton(discord.ui.Button):
+    def __init__(self, answer_view: "PollAnswerView", action: str, label: str, style: discord.ButtonStyle, row: int = 4):
+        super().__init__(label=label, style=style, row=row)
+        self.answer_view = answer_view
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.answer_view
+        if self.action == "save":
+            poll = schedule_polls.get(view.poll_id)
+            if not poll or not poll_is_open(poll):
+                await interaction.response.edit_message(content="この日程調整は締切済みです。", view=None)
+                return
+            if any(value not in {"○", "△", "×"} for value in view.values):
+                await interaction.response.send_message("未回答の候補があります。各候補で ○ / △ / × を選んでください。", ephemeral=True)
+                return
+            poll.setdefault("responses", {})[str(interaction.user.id)] = list(view.values)
+            save_schedule_polls()
+            await interaction.response.edit_message(content="回答を保存しました。変更する場合は「回答する」から再度入力できます。", view=None)
+            await refresh_poll_message(view.poll_id)
+            return
+        view.page += -1 if self.action == "prev" else 1
+        view.rebuild()
+        await interaction.response.edit_message(content=view.prompt(), view=view)
+
+
+class PollAnswerView(discord.ui.View):
+    """Private, Chouseisan-like date rows with three clear choice buttons."""
+    PAGE_SIZE = 3
+
+    def __init__(self, poll_id: str, user_id: int):
+        super().__init__(timeout=900)
+        self.poll_id = poll_id
+        self.user_id = user_id
+        poll = schedule_polls[poll_id]
+        saved = poll.get("responses", {}).get(str(user_id), [])
+        self.values = [saved[i] if i < len(saved) and saved[i] in {"○", "△", "×"} else "" for i in range(len(poll["candidates"]))]
+        self.page = 0
+        self.rebuild()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("この回答画面は開いた本人だけが操作できます。", ephemeral=True)
+            return False
+        return True
+
+    def prompt(self) -> str:
+        count = len(schedule_polls[self.poll_id]["candidates"])
+        pages = (count + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        poll = schedule_polls[self.poll_id]
+        start = self.page * self.PAGE_SIZE
+        end = min(start + self.PAGE_SIZE, count)
+        dates = "\n".join(
+            f"**{i + 1}. {datetime.datetime.fromisoformat(poll['candidates'][i]).astimezone(JST).strftime('%Y/%m/%d (%a) %H:%M')}**"
+            for i in range(start, end)
+        )
+        return f"**予定を入力してください**　({self.page + 1}/{pages})\n{dates}\n\n各候補のボタンから回答を選択してください。選択済みには ✓ が付きます。"
+
+    def rebuild(self):
+        self.clear_items()
+        poll = schedule_polls[self.poll_id]
+        start = self.page * self.PAGE_SIZE
+        end = min(start + self.PAGE_SIZE, len(poll["candidates"]))
+        for index in range(start, end):
+            row = index - start
+            self.add_item(CandidateAnswerButton(self, index, "○", "🟢 ○ 参加", discord.ButtonStyle.success, row))
+            self.add_item(CandidateAnswerButton(self, index, "△", "🟡 △ 未定", discord.ButtonStyle.primary, row))
+            self.add_item(CandidateAnswerButton(self, index, "×", "🔴 × 不参加", discord.ButtonStyle.danger, row))
+        if self.page > 0:
+            self.add_item(PollAnswerNavButton(self, "prev", "前へ", discord.ButtonStyle.secondary))
+        if end < len(poll["candidates"]):
+            self.add_item(PollAnswerNavButton(self, "next", "次へ", discord.ButtonStyle.secondary))
+        else:
+            self.add_item(PollAnswerNavButton(self, "save", "回答を保存", discord.ButtonStyle.success))
+
+
+class PollCreateModal(discord.ui.Modal, title="日程調整を作成"):
+    title_input = discord.ui.TextInput(label="イベント名", max_length=100)
+    candidates_input = discord.ui.TextInput(label="候補日時（1行に1件、YYYY-MM-DD HH:MM）", style=discord.TextStyle.paragraph, placeholder="2026-10-10 21:00\n2026-10-11 21:00", max_length=1000)
+    deadline_input = discord.ui.TextInput(label="締切（任意、YYYY-MM-DD HH:MM）", required=False, placeholder="2026-10-09 23:00", max_length=16)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            dates = [datetime.datetime.strptime(line.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=JST) for line in self.candidates_input.value.splitlines() if line.strip()]
+            if not 2 <= len(dates) <= 20 or len(set(dates)) != len(dates):
+                raise ValueError("候補日時は重複なしで2〜20件入力してください。")
+            if any(value <= datetime.datetime.now(JST) for value in dates):
+                raise ValueError("候補日時は現在より後の日時にしてください。")
+            deadline = None
+            if self.deadline_input.value.strip():
+                deadline_dt = datetime.datetime.strptime(self.deadline_input.value.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+                if deadline_dt <= datetime.datetime.now(JST):
+                    raise ValueError("締切は現在より後にしてください。")
+                deadline = deadline_dt.astimezone(datetime.timezone.utc).isoformat()
+        except ValueError as exc:
+            await interaction.response.send_message(f"入力を確認してください: {exc}", ephemeral=True)
+            return
+        poll_id = hashlib.sha1(f"{interaction.guild_id}:{interaction.id}".encode()).hexdigest()[:12]
+        poll = {"id": poll_id, "guild_id": interaction.guild_id, "channel_id": interaction.channel_id,
+                "message_id": None, "title": self.title_input.value, "creator_id": interaction.user.id,
+                "candidates": [value.astimezone(datetime.timezone.utc).isoformat() for value in dates],
+                "deadline": deadline, "closed": False, "responses": {}}
+        schedule_polls[poll_id] = poll
+        message = await interaction.channel.send(embed=poll_embed(poll), view=PollView(poll_id))
+        poll["message_id"] = message.id
+        save_schedule_polls()
+        await interaction.response.send_message("日程調整を作成しました。", ephemeral=True)
+
+
+class PollCreateView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="候補日時を入力", style=discord.ButtonStyle.primary)
+    async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PollCreateModal())
+
+
+class PollView(discord.ui.View):
+    def __init__(self, poll_id: str):
+        super().__init__(timeout=None)
+        self.poll_id = poll_id
+        for button in self.children:
+            button.custom_id = f"schedule:{poll_id}:{button.label}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        poll = schedule_polls.get(self.poll_id)
+        if not poll:
+            await interaction.response.send_message("日程調整が見つかりません。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="回答する", style=discord.ButtonStyle.success)
+    async def answer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        poll = schedule_polls[self.poll_id]
+        if not poll_is_open(poll):
+            await interaction.response.send_message("この日程調整は締切済みです。", ephemeral=True)
+            return
+        view = PollAnswerView(self.poll_id, interaction.user.id)
+        await interaction.response.send_message(view.prompt(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="結果を見る", style=discord.ButtonStyle.secondary)
+    async def results(self, interaction: discord.Interaction, button: discord.ui.Button):
+        poll = schedule_polls[self.poll_id]
+        if not poll.get("responses"):
+            await interaction.response.send_message("まだ回答はありません。", ephemeral=True)
+            return
+        responses = list(poll["responses"].items())
+        result_embeds = []
+        candidates = poll["candidates"]
+        for candidate_start in range(0, len(candidates), 3):
+            candidate_indexes = range(candidate_start, min(candidate_start + 3, len(candidates)))
+            for user_start in range(0, len(responses), 20):
+                user_batch = responses[user_start:user_start + 20]
+                embed = discord.Embed(
+                    title=f"📊 {poll['title']} — 回答一覧",
+                    description=f"回答者 {user_start + 1}〜{user_start + len(user_batch)} 人目",
+                    color=0x5865F2,
+                )
+                for index in candidate_indexes:
+                    date_label = datetime.datetime.fromisoformat(candidates[index]).astimezone(JST).strftime("%m/%d (%a) %H:%M")
+                    values = [answers[index] if index < len(answers) else "—" for _, answers in user_batch]
+                    field_value = "\n".join(f"<@{user_id}>　{value}" for (user_id, _), value in zip(user_batch, values)) or "回答なし"
+                    embed.add_field(name=date_label, value=field_value, inline=True)
+                result_embeds.append(embed)
+        await interaction.response.send_message(embed=result_embeds[0], ephemeral=False)
+        for embed in result_embeds[1:]:
+            await interaction.followup.send(embed=embed, ephemeral=False)
+
+    @discord.ui.button(label="締め切る", style=discord.ButtonStyle.danger)
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        poll = schedule_polls[self.poll_id]
+        if interaction.user.id != poll["creator_id"] and not interaction.user.guild_permissions.manage_events:
+            await interaction.response.send_message("作成者またはイベント管理権限を持つユーザーのみ締め切れます。", ephemeral=True)
+            return
+        poll["closed"] = True
+        save_schedule_polls()
+        await interaction.response.edit_message(embed=poll_embed(poll), view=self)
+
+
+async def refresh_poll_message(poll_id: str) -> None:
+    poll = schedule_polls.get(poll_id)
+    if not poll or not poll.get("message_id"):
+        return
+    channel = bot.get_channel(poll["channel_id"])
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(poll["message_id"])
+        await message.edit(embed=poll_embed(poll), view=PollView(poll_id))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
 
 # ---------- Web controller state ----------
 web_playback_state: dict = {"future": None}
@@ -172,7 +444,7 @@ def split_text_for_discord(text: str, limit: int = 1900) -> list[str]:
 
 
 async def collect_reply_chain_messages(
-    message: discord.Message, max_messages: int = MAX_REPLY_CHAIN_MESSAGES
+        message: discord.Message, max_messages: int = MAX_REPLY_CHAIN_MESSAGES
 ) -> list[discord.Message]:
     chain: list[discord.Message] = []
     visited_ids: set[int] = set()
@@ -205,6 +477,14 @@ async def collect_reply_chain_messages(
 @bot.event
 async def on_ready():
     print(f"[INFO] Logged in as {bot.user}")
+    load_schedule_polls()
+    for poll_id, poll in schedule_polls.items():
+        if poll.get("message_id"):
+            bot.add_view(PollView(poll_id), message_id=poll["message_id"])
+    try:
+        await bot.tree.sync()
+    except discord.HTTPException as exc:
+        print(f"[WARN] スラッシュコマンドを同期できません: {exc}")
     for guild in bot.guilds:
         print(f"[INFO] Guild: {guild.name} (id={guild.id})")
         for channel in guild.channels:
@@ -366,7 +646,7 @@ def parse_timed_lines(script_text: str) -> list[tuple[int, str]]:
 
 
 async def synthesize_and_play_timeline(
-    timed_lines: list[tuple[int, str]], target_channel_id: int, origin_time: float
+        timed_lines: list[tuple[int, str]], target_channel_id: int, origin_time: float
 ):
     channel = bot.get_channel(target_channel_id)
     if not isinstance(channel, discord.VoiceChannel):
@@ -422,6 +702,14 @@ _schedule_broadcast = web_controller.schedule_broadcast
 
 
 # ---------- Discord commands ----------
+@bot.tree.command(name="schedule", description="Discord内で日程調整を作成します")
+async def schedule_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "日程調整の候補日時を入力してください。日時は日本時間です。",
+        view=PollCreateView(), ephemeral=True,
+    )
+
+
 @bot.command()
 async def create_event(ctx, event_name: str, *date_strs: str):
     if not date_strs:
